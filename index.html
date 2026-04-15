@@ -6,6 +6,165 @@
   <title>Radar CNPJ</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="page-wrapper">
+    <header class="hero">
+      <div class="hero-top">
+        <span class="eyebrow">Inteligência de Domínios</span>
+        <h1>Radar CNPJ</h1>
+        <p class="hero-subtitle">Descubra CNPJ, infraestrutura de email e informações da empresa por domínio</p>
+      </div>
+
+      <form id="lookup-form" class="lookup-form">
+        <input id="domain-input" type="text" placeholder="exemplo.com.br" required>
+        <button type="submit">Pesquisar</button>
+      </form>
+
+      <div class="hero-actions">
+        <label class="upload-link">
+          📊 Importar CSV/XLSX
+          <input id="csv-upload" type="file" accept=".csv,.xlsx" hidden>
+        </label>
+      </div>
+    </header>
+
+    <main class="container">
+      <div id="status-panel" class="panel panel-highlight" style="display: none;">
+        <div class="panel-kicker">Status</div>
+        <h2 id="status-text">Pesquisando...</h2>
+        <div class="progress-container">
+          <div class="progress-bar">
+            <div id="progress-fill" class="progress-fill"></div>
+          </div>
+          <p id="progress-text" class="progress-text">Iniciando...</p>
+        </div>
+      </div>
+
+      <div class="results-grid">
+        <div id="summary-panel" class="panel panel-wide" style="display: none;">
+          <div class="panel-heading">
+            <h2>Resumo da Pesquisa</h2>
+          </div>
+          <div class="summary-list">
+            <div>
+              <dt>Domínio</dt>
+              <dd id="summary-domain">-</dd>
+            </div>
+            <div>
+              <dt>Empresa</dt>
+              <dd id="summary-org">-</dd>
+            </div>
+            <div>
+              <dt>CNPJs Encontrados</dt>
+              <dd id="summary-cnpj-count">-</dd>
+            </div>
+            <div>
+              <dt>Registros MX</dt>
+              <dd id="summary-mx-count">-</dd>
+            </div>
+          </div>
+        </div>
+
+        <div id="mx-panel" class="panel" style="display: none;">
+          <div class="panel-heading">
+            <h2>Infraestrutura de Email</h2>
+          </div>
+          <div id="mx-results" class="stack-list"></div>
+        </div>
+
+        <div id="cnpj-panel" class="panel" style="display: none;">
+          <div class="panel-heading">
+            <h2>CNPJs Encontrados</h2>
+          </div>
+          <div id="cnpj-results" class="stack-list"></div>
+        </div>
+
+        <div id="clue-panel" class="panel panel-wide" style="display: none;">
+          <div class="panel-heading">
+            <h2>Pistas Institucionais</h2>
+          </div>
+          <div id="clue-results" class="clue-grid"></div>
+        </div>
+      </div>
+
+      <div id="batch-results-section" class="results-grid" style="display: none;">
+        <div class="panel panel-wide">
+          <div class="panel-heading">
+            <h2>Resultados da Importação</h2>
+          </div>
+          <div id="batch-results" class="batch-results-container"></div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Templates -->
+  <template id="mx-item-template">
+    <div class="card-item">
+      <div class="card-item-header">
+        <strong data-provider>Provedor</strong>
+        <span class="badge" data-provider-type>-</span>
+      </div>
+      <p data-host></p>
+    </div>
+  </template>
+
+  <template id="cnpj-item-template">
+    <div class="card-item">
+      <div class="card-item-header">
+        <strong data-cnpj>00.000.000/0000-00</strong>
+      </div>
+      <p data-company></p>
+      <p class="muted" data-meta></p>
+    </div>
+  </template>
+
+  <template id="clue-item-template">
+    <div class="clue-card">
+      <strong data-label>Label</strong>
+      <strong data-title>Título</strong>
+      <p data-body></p>
+      <a data-link target="_blank">Ver página</a>
+    </div>
+  </template>
+
+  <template id="batch-item-template">
+    <div class="batch-item">
+      <div class="batch-item-header">
+        <span class="batch-domain" data-domain></span>
+        <span class="batch-status" data-status>Processando</span>
+      </div>
+      <div class="batch-data">
+        <div class="batch-data-row">
+          <span class="batch-label">CNPJ</span>
+          <span class="batch-value" data-cnpj>-</span>
+        </div>
+        <div class="batch-data-row">
+          <span class="batch-label">Empresa</span>
+          <span class="batch-value" data-company>-</span>
+        </div>
+        <div class="batch-data-row">
+          <span class="batch-label">Email</span>
+          <span class="batch-value" data-email>-</span>
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <script src="app.js"></script>
+</body>
+</html>
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Radar CNPJ</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="styles.css">
 </head>
