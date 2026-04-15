@@ -1,0 +1,144 @@
+#!/usr/bin/env node
+
+/**
+ * ⚡ QUICK START - Guia rápido de 5 minutos
+ * 
+ * Este arquivo demonstra como começar em 5 minutos!
+ */
+
+console.log(`
+╔═══════════════════════════════════════════════════════════════╗
+║                   🚀 QUICK START - 5 MINUTOS                 ║
+║            Extração de CNPJ com Scraping + OpenAI             ║
+╚═══════════════════════════════════════════════════════════════╝
+
+🎯 OBJETIVO:
+   Extrair CNPJ de uma URL usando scraping + OpenAI como fallback
+
+⚡ PASSO 1: Instalar dependências
+   $ npm install
+
+🔑 PASSO 2: Configurar API Key OpenAI
+   a) Copie .env.example para .env
+   b) Adicione sua chave: OPENAI_API_KEY=sk-proj-SEU-API-KEY
+   c) Obtenha em: https://platform.openai.com/api-keys
+
+📝 PASSO 3: Criar seu primeiro script
+   
+   // seu-script.js
+   import { extractCnpjFromUrl } from './extract-cnpj-openai.js';
+   
+   const cnpj = await extractCnpjFromUrl('https://www.google.com');
+   console.log(cnpj); // "34.028.316/0001-86"
+
+▶️  PASSO 4: Executar
+   $ node seu-script.js
+
+📚 PASSO 5: Explore mais
+   $ npm run examples    # Ver exemplos
+   $ npm run test        # Executar testes
+   
+╔═══════════════════════════════════════════════════════════════╗
+║                       EXEMPLO MÍNIMO                          ║
+╚═══════════════════════════════════════════════════════════════╝
+
+import { extractCnpjFromUrl } from './extract-cnpj-openai.js';
+
+// Extrair CNPJ de uma URL
+const cnpj = await extractCnpjFromUrl('https://www.empresa.com.br');
+
+if (cnpj) {
+  console.log('✅ CNPJ encontrado:', cnpj);
+} else {
+  console.log('❌ CNPJ não encontrado');
+}
+
+╔═══════════════════════════════════════════════════════════════╗
+║                    EXEMPLOS DE USO                            ║
+╚═══════════════════════════════════════════════════════════════╝
+
+// 1️⃣ Extrair de uma URL
+const cnpj1 = await extractCnpjFromUrl('https://www.google.com');
+
+// 2️⃣ Processar múltiplas URLs
+const urls = ['https://site1.com', 'https://site2.com'];
+for (const url of urls) {
+  const cnpj = await extractCnpjFromUrl(url);
+  await new Promise(r => setTimeout(r, 2000)); // Aguardar 2s
+}
+
+// 3️⃣ Validar CNPJ
+import { isValidCNPJ } from './extract-cnpj-openai.js';
+const isValid = isValidCNPJ('34.028.316/0001-86'); // true
+
+// 4️⃣ Normalizar CNPJ
+import { normalizeCNPJExport } from './extract-cnpj-openai.js';
+const normalized = normalizeCNPJExport('34028316000186');
+// "34.028.316/0001-86"
+
+╔═══════════════════════════════════════════════════════════════╗
+║                      COMMANDS                                 ║
+╚═══════════════════════════════════════════════════════════════╝
+
+npm start      → Inicia a aplicação
+npm run test   → Executa testes de validação de CNPJ
+npm run examples → Executa exemplos de uso
+npm run dev    → Modo desenvolvimento com --watch
+
+╔═══════════════════════════════════════════════════════════════╗
+║                      ESTRUTURA DE ARQUIVOS                    ║
+╚═══════════════════════════════════════════════════════════════╝
+
+extract-cnpj-openai.js   → Código principal (importar este!)
+example-openai.js        → 5 exemplos de uso
+test-openai.js           → Suite de testes
+package.json             → Dependências do projeto
+.env.example             → Template de configuração
+README_OPENAI.md         → Documentação completa
+
+╔═══════════════════════════════════════════════════════════════╗
+║                    TROUBLESHOOTING                            ║
+╚═══════════════════════════════════════════════════════════════╝
+
+❌ "OPENAI_API_KEY is not set"
+   → Verifique se criou o arquivo .env com sua chave
+
+❌ "Module not found: 'openai'"
+   → Execute: npm install
+
+❌ "Invalid API key"
+   → Verifique sua chave em: https://platform.openai.com/api-keys
+
+❌ "Timeout exceeded"
+   → A página demorou muito. Tente novamente ou aumente timeout.
+
+❌ "CNPJ not found"
+   → Scraping falhou e OpenAI não conhece a empresa.
+     Normal para empresas obscuras ou sites dinâmicos.
+
+╔═══════════════════════════════════════════════════════════════╗
+║                    PRÓXIMOS PASSOS                            ║
+╚═══════════════════════════════════════════════════════════════╝
+
+1. Rode: npm run test
+   → Verifica se validação de CNPJ funciona
+
+2. Rode: npm run examples
+   → Vê exemplos prático em ação
+
+3. Crie seu próprio script:
+   → Copie o código de exemplo do README_OPENAI.md
+
+4. Integre em seu projeto:
+   → Import { extractCnpjFromUrl } from './extract-cnpj-openai.js'
+
+5. Processe lotes de URLs:
+   → Use loop com delay entre requisições (evite rate limit)
+
+╔═══════════════════════════════════════════════════════════════╗
+║              ✨ Você está pronto para começar! ✨              ║
+╚═══════════════════════════════════════════════════════════════╝
+
+Dúvidas? Veja README_OPENAI.md para documentação completa.
+
+`);

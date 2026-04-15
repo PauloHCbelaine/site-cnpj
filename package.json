@@ -1,0 +1,31 @@
+{
+  "name": "extract-cnpj-openai",
+  "version": "1.0.0",
+  "description": "Extração de CNPJ com Scraping + OpenAI ChatGPT",
+  "main": "extract-cnpj-openai.js",
+  "type": "module",
+  "scripts": {
+    "start": "node extract-cnpj-openai.js",
+    "examples": "node example-openai.js",
+    "test": "node test-openai.js",
+    "dev": "node --watch extract-cnpj-openai.js"
+  },
+  "keywords": [
+    "cnpj",
+    "extraction",
+    "openai",
+    "scraping",
+    "brazil"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "openai": "^4.31.0",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {},
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
