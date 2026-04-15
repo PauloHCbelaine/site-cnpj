@@ -32,4 +32,4 @@ Aplicacao estatica em HTML, CSS e JavaScript para investigar um dominio e reunir
 - adicionar validacao oficial de CNPJ
 - integrar consulta RDAP/WHOIS onde houver dados publicos
 - permitir exportar relatorio em JSON ou CSV
-- criar backend proprio para reduzir dependencia de proxies externos teste1ex
+- criar backend proprio para reduzir dependencia de proxies externos.
