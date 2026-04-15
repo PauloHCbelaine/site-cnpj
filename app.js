@@ -208,7 +208,20 @@ async function fetchClueForPath(domain, path) {
       return null;
     }
 
-    return parseClue(text, pageUrl);
+    const clue = parseClue(text, pageUrl);
+    
+    // Se não encontrou CNPJ e temos acesso ao HTML, busca de forma mais agressiva
+    if (clue && clue.cnpjs.length === 0) {
+      const aggressiveCnpjs = extractCnpjsAggressive(text);
+      clue.cnpjs = aggressiveCnpjs.map((cnpj) => ({
+        raw: cnpj,
+        digits: onlyDigits(cnpj),
+        formatted: formatCnpj(cnpj),
+        sourceUrl: pageUrl,
+      }));
+    }
+    
+    return clue;
   } catch {
     return null;
   }
@@ -236,23 +249,100 @@ function parseClue(text, sourceUrl) {
 }
 
 function extractCnpjs(text) {
-  const matches = text.match(/\b\d{2}[.\s]?\d{3}[.\s]?\d{3}[\/\s]?\d{4}[-\s]?\d{2}\b/g) || [];
-  const unique = matches.filter((value, index, array) => array.indexOf(value) === index);
-  return unique.filter(cnpj => validateCnpj(cnpj));
+  const patterns = [
+    // Padrão formatado: XX.XXX.XXX/XXXX-XX
+    /\b\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}\b/g,
+    // Padrão com espaços/caracteres: XX XXX XXX XXXX XX
+    /\b\d{2}[\s\-.]?\d{3}[\s\-.]?\d{3}[\s\/\-.]?\d{4}[\s\-.]?\d{2}\b/g,
+    // Padrão sem formatação: 14 dígitos
+    /\b\d{14}\b/g,
+    // CNPJ após "CNPJ:" ou "CNPJ ="
+    /(?:cnpj|cnpj:|cnpj\s*=|cnpj\s*:)[\s]*([\d.\-/\s]+)/gi,
+    // Padrão em contexto de rodapé
+    /(?:empresa|cnpj|registr)\s*(?:n[°º]|:)?\s*([\d.\-/\s]{14,20})/gi,
+  ];
+  
+  const matches = new Set();
+  
+  for (const pattern of patterns) {
+    const found = text.match(pattern);
+    if (found) {
+      found.forEach(match => {
+        // Extrai números da match
+        const digits = match.replace(/\D/g, '');
+        if (digits.length === 14 && validateCnpj(match)) {
+          matches.add(formatCnpj(digits));
+        }
+      });
+    }
+  }
+  
+  return Array.from(matches);
 }
 
 function findOrganization(text) {
+  // Schema.org / JSON-LD
   const jsonLdMatch = text.match(/"name"\s*:\s*"([^"]+)"/i);
   if (jsonLdMatch?.[1]) {
     return jsonLdMatch[1].trim();
   }
 
+  // Meta tags OpenGraph
+  const ogMatch = text.match(/property="og:title"\s+content="([^"]+)"/i);
+  if (ogMatch?.[1]) {
+    return ogMatch[1].trim();
+  }
+
+  // Copyright/rodapé
   const copyrightMatch = text.match(/(?:copyright|todos os direitos reservados|©)\s+([^.\n|]{3,90})/i);
   if (copyrightMatch?.[1]) {
     return copyrightMatch[1].trim();
   }
+  
+  // Razão social em meta tags
+  const companyMatch = text.match(/(?:company|empresa|razao[_-]social)\s*[=:]\s*["']?([^"'\n]{5,90})/i);
+  if (companyMatch?.[1]) {
+    return companyMatch[1].trim();
+  }
 
   return null;
+}
+
+function extractCnpjsAggressive(text) {
+  // Busca ainda mais agressiva - procura em todo o HTML
+  const cnpjs = new Set();
+  
+  // Busca em atributos data-*
+  const dataMatches = text.match(/data-(?:cnpj|company|empresa)[^>]*[=\s](["']?[\d.\-/\s]+["']?)/gi);
+  if (dataMatches) {
+    dataMatches.forEach(m => {
+      const digits = m.replace(/\D/g, '');
+      if (digits.length === 14 && validateCnpj(m)) {
+        cnpjs.add(formatCnpj(m));
+      }
+    });
+  }
+  
+  // Busca em scripts JSON
+  const scriptMatches = text.match(/<script[^>]*>([\s\S]*?)<\/script>/gi);
+  if (scriptMatches) {
+    scriptMatches.forEach(script => {
+      try {
+        const matches = script.match(/\d{2}\.?\d{3}\.?\d{3}\/?\d{4}-?\d{2}/g);
+        if (matches) {
+          matches.forEach(m => {
+            if (validateCnpj(m)) {
+              cnpjs.add(formatCnpj(m));
+            }
+          });
+        }
+      } catch (e) {
+        // Ignora erros de parsing
+      }
+    });
+  }
+  
+  return Array.from(cnpjs);
 }
 
 function summarizeText(lines) {

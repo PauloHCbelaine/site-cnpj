@@ -12,31 +12,22 @@
 <body>
   <div class="page-shell">
     <header class="hero">
-      <p class="eyebrow">Investigacao de dominio</p>
-      <h1>Descubra MX, sinais de CNPJ e contexto da empresa a partir de um dominio.</h1>
-      <p class="hero-copy">
-        O app faz lookup MX, inspeciona paginas principais do site e tenta localizar CNPJs ou pistas institucionais.
-        Quando encontra um CNPJ valido, busca dados publicos complementares da empresa.
-      </p>
+      <div class="hero-top">
+        <h1>Radar CNPJ</h1>
+        <p class="hero-subtitle">Descubra MX e CNPJ de um dominio</p>
+      </div>
+      
       <form id="lookup-form" class="lookup-form">
         <label for="domain-input" class="sr-only">Digite o dominio</label>
         <input id="domain-input" name="domain" type="text" placeholder="ex.: empresa.com.br" autocomplete="off" spellcheck="false" required>
-        <button type="submit">Analisar dominio</button>
+        <button type="submit">Analisar</button>
       </form>
       
-      <div class="upload-section">
-        <label for="csv-upload" class="upload-label">
-          <span class="upload-icon">📊</span>
-          Carregar planilha (.csv ou .xlsx)
+      <div class="hero-actions">
+        <label for="csv-upload" class="upload-link">
+          📊 Carregar CSV/XLSX
         </label>
         <input id="csv-upload" type="file" accept=".csv,.xlsx" hidden>
-        <p class="upload-hint">Formato: coluna com URLs ou domínios</p>
-      </div>
-
-      <div class="quick-notes">
-        <span>Sem backend</span>
-        <span>MX via DNS-over-HTTPS</span>
-        <span>CNPJ por evidencias publicas</span>
       </div>
     </header>
 
