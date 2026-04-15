@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Radar de Domínio e CNPJ</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="page-shell">
+    <header class="hero">
+      <p class="eyebrow">Investigacao de dominio</p>
+      <h1>Descubra MX, ssinais de CNPJ e contexto da empresa a partir de um dominio.</h1>
+      <p class="hero-copy">
+        O app faz lookup MX, inspeciona paginas principais do site e tenta localizar CNPJs ou pistas institucionais.
+        Quando encontra um CNPJ valido, busca dados publicos complementares da empresa.
+      </p>
+      <form id="lookup-form" class="lookup-form">
+        <label for="domain-input" class="sr-only">Digite o dominio</label>
+        <input id="domain-input" name="domain" type="text" placeholder="ex.: empresa.com.br" autocomplete="off" spellcheck="false" required>
+        <button type="submit">Analisar dominio</button>
+      </form>
+      <div class="quick-notes">
+        <span>Sem backend</span>
+        <span>MX via DNS-over-HTTPS</span>
+        <span>CNPJ por evidencias publicas</span>
+      </div>
+    </header>
+
+    <main class="results-grid">
+      <section class="panel panel-highlight" id="status-panel">
+        <div class="panel-heading">
+          <p class="panel-kicker">Status</p>
+          <h2>Pronto para pesquisar</h2>
+        </div>
+        <p id="status-text">
+          Informe um dominio principal para iniciar a coleta de MX, metadados institucionais e possiveis CNPJs publicados no proprio site.
+        </p>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <p class="panel-kicker">Resumo</p>
+          <h2>Visao geral</h2>
+        </div>
+        <dl id="summary-list" class="summary-list">
+          <div>
+            <dt>Dominio analisado</dt>
+            <dd>-</dd>
+          </div>
+          <div>
+            <dt>Dominio principal</dt>
+            <dd>-</dd>
+          </div>
+          <div>
+            <dt>Organizacao</dt>
+            <dd>-</dd>
+          </div>
+          <div>
+            <dt>CNPJs encontrados</dt>
+            <dd>-</dd>
+          </div>
+        </dl>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <p class="panel-kicker">MX</p>
+          <h2>Registros de e-mail</h2>
+        </div>
+        <div id="mx-results" class="stack-list empty-state">
+          Nenhum lookup executado ainda.
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <p class="panel-kicker">CNPJ</p>
+          <h2>Possiveis vinculacoes</h2>
+        </div>
+        <div id="cnpj-results" class="stack-list empty-state">
+          Nenhum CNPJ localizado ate o momento.
+        </div>
+      </section>
+
+      <section class="panel panel-wide">
+        <div class="panel-heading">
+          <p class="panel-kicker">Pistas do site</p>
+          <h2>Fontes e metadados coletados</h2>
+        </div>
+        <div id="clue-results" class="clue-grid empty-state">
+          As evidencias encontradas no site aparecerao aqui.
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <template id="mx-item-template">
+    <article class="card-item">
+      <div class="card-item-header">
+        <strong data-host></strong>
+        <span class="badge" data-priority></span>
+      </div>
+      <p data-meta></p>
+    </article>
+  </template>
+
+  <template id="cnpj-item-template">
+    <article class="card-item">
+      <div class="card-item-header">
+        <strong data-cnpj></strong>
+        <span class="badge" data-source></span>
+      </div>
+      <p data-company></p>
+      <p class="muted" data-extra></p>
+    </article>
+  </template>
+
+  <template id="clue-item-template">
+    <article class="clue-card">
+      <p class="clue-label" data-label></p>
+      <strong data-title></strong>
+      <p data-body></p>
+      <a data-link target="_blank" rel="noreferrer noopener">Abrir fonte</a>
+    </article>
+  </template>
+
+  <script src="app.js" type="module"></script>
+</body>
+</html>
