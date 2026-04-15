@@ -5,14 +5,548 @@ const JINA_PROXY = "https://r.jina.ai/";
 const COMMON_PATHS = ["/", "/contato", "/sobre", "/empresa", "/quem-somos", "/institucional"];
 const BR_SECOND_LEVEL = new Set(["com.br", "co.br", "gov.br", "edu.br", "org.br", "net.br", "jus.br"]);
 
+// Wait for DOM to be ready
+document.addEventListener("DOMContentLoaded", () => {
+  // DOM Elements
+  const form = document.querySelector("#lookup-form");
+  const input = document.querySelector("#domain-input");
+  const csvUpload = document.querySelector("#csv-upload");
+  const uploadLabel = document.querySelector(".upload-label");
+
+  const statusPanel = document.querySelector("#status-panel");
+  const statusText = document.querySelector("#status-text");
+  const statusHeading = statusPanel?.querySelector("h2");
+  const progressContainer = document.querySelector("#progress-container");
+  const progressFill = document.querySelector("#progress-fill");
+  const progressText = document.querySelector("#progress-text");
+
+  const summaryList = document.querySelector("#summary-list");
+  const mxResults = document.querySelector("#mx-results");
+  const cnpjResults = document.querySelector("#cnpj-results");
+  const clueResults = document.querySelector("#clue-results");
+
+  const batchResultsSection = document.querySelector("#batch-results-section");
+  const batchResults = document.querySelector("#batch-results");
+
+  // Templates
+  const mxTemplate = document.querySelector("#mx-item-template");
+  const cnpjTemplate = document.querySelector("#cnpj-item-template");
+  const clueTemplate = document.querySelector("#clue-item-template");
+  const batchTemplate = document.querySelector("#batch-item-template");
+
+  // Utilities
+  function normalizeDomain(value) {
+    const cleaned = value
+      .toLowerCase()
+      .replace(/^https?:\/\//, "")
+      .replace(/^www\./, "")
+      .replace(/\/.*$/, "")
+      .trim();
+
+    if (!cleaned || !/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(cleaned)) return null;
+
+    const parts = cleaned.split(".").filter(Boolean);
+    const suffix = parts.slice(-2).join(".");
+    const isSecondLevel = parts.length > 2 && BR_SECOND_LEVEL.has(suffix);
+    const rootDomain = isSecondLevel ? parts.slice(-3).join(".") : parts.length > 2 ? parts.slice(-2).join(".") : cleaned;
+
+    return { displayDomain: cleaned, rootDomain };
+  }
+
+  function validateCnpj(value) {
+    const digits = String(value).replace(/\D/g, "");
+    if (digits.length !== 14) return false;
+    if (/^(\d)\1{13}$/.test(digits)) return false;
+
+    let sum = 0, mult = 5;
+    for (let i = 0; i < 8; i++) {
+      sum += parseInt(digits[i]) * mult;
+      mult = mult === 2 ? 9 : mult - 1;
+    }
+    let remainder = sum % 11;
+    const d1 = remainder < 2 ? 0 : 11 - remainder;
+
+    if (parseInt(digits[8]) !== d1) return false;
+
+    sum = 0;
+    mult = 6;
+    for (let i = 0; i < 9; i++) {
+      sum += parseInt(digits[i]) * mult;
+      mult = mult === 2 ? 9 : mult - 1;
+    }
+    remainder = sum % 11;
+    const d2 = remainder < 2 ? 0 : 11 - remainder;
+
+    return parseInt(digits[10]) === d2;
+  }
+
+  function formatCnpj(value) {
+    const digits = String(value).replace(/\D/g, "");
+    if (digits.length !== 14) return value;
+    return digits.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, "$1.$2.$3/$4-$5");
+  }
+
+  function extractCnpjs(text) {
+    const cnpjs = new Set();
+    const patterns = [
+      /\b\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}\b/g,
+      /\b\d{2}[\s\-.]?\d{3}[\s\-.]?\d{3}[\s\/\-.]?\d{4}[\s\-.]?\d{2}\b/g,
+      /\b\d{14}\b/g,
+    ];
+
+    for (const pattern of patterns) {
+      const matches = text.match(pattern);
+      if (matches) {
+        matches.forEach(match => {
+          const digits = match.replace(/\D/g, "");
+          if (digits.length === 14 && validateCnpj(digits)) {
+            cnpjs.add(formatCnpj(digits));
+          }
+        });
+      }
+    }
+    return Array.from(cnpjs);
+  }
+
+  function findOrganization(text) {
+    const jsonLd = text.match(/"name"\s*:\s*"([^"]{5,100})"/i);
+    if (jsonLd?.[1]) return jsonLd[1].trim();
+
+    const og = text.match(/property="og:title"\s+content="([^"]{5,100})"/i);
+    if (og?.[1]) return og[1].trim();
+
+    const copyright = text.match(/(?:©|copyright)\s+([^.\n|]{5,100})/i);
+    if (copyright?.[1]) return copyright[1].trim();
+
+    return null;
+  }
+
+  function classifyMxProvider(host) {
+    const normalized = host.toLowerCase();
+    
+    const providers = {
+      "Google Workspace": ["aspmx.l.google.com", "google.com"],
+      "Microsoft 365": ["outlook.com", "hotmail.com", "microsoft.com"],
+      "Zoho Mail": ["zoho.com"],
+      "Amazon SES": ["amazonses.com"],
+      "SendGrid": ["sendgrid.com"],
+      "Mailgun": ["mailgun.org", "mailgun.com"],
+    };
+    
+    for (const [provider, domains] of Object.entries(providers)) {
+      if (domains.some(d => normalized.includes(d))) return provider;
+    }
+    
+    const parts = normalized.split(".");
+    return parts.length >= 2 ? parts[parts.length - 2].toUpperCase() : "Outro";
+  }
+
+  // API Calls
+  async function lookupMx(domain) {
+    try {
+      const response = await fetch(`${DNS_ENDPOINT}?name=${encodeURIComponent(domain)}&type=MX`);
+      const data = await response.json();
+      const answers = data.Answer || [];
+      return answers
+        .map(record => {
+          const [priority, ...hostParts] = String(record.data).split(" ");
+          const host = hostParts.join(" ").replace(/\.$/, "");
+          return { host, priority, ttl: record.TTL, provider: classifyMxProvider(host) };
+        })
+        .filter(r => r.host);
+    } catch (e) {
+      console.error("MX lookup failed:", e);
+      return [];
+    }
+  }
+
+  async function fetchPage(domain, path = "/") {
+    try {
+      const response = await fetch(`${JINA_PROXY}http://${domain}${path}`, { signal: AbortSignal.timeout(8000) });
+      if (!response.ok) return null;
+      return await response.text();
+    } catch (e) {
+      console.error(`Error fetching ${domain}${path}:`, e.message);
+      return null;
+    }
+  }
+
+  async function enrichCnpj(cnpj) {
+    try {
+      const response = await fetch(`${BRASIL_API}${cnpj.replace(/\D/g, "")}`);
+      if (!response.ok) throw new Error("Not found");
+      const data = await response.json();
+      return {
+        company: data.nome_fantasia || data.razao_social,
+        status: data.descricao_situacao_cadastral,
+        city: data.municipio,
+        state: data.uf,
+      };
+    } catch (e) {
+      return { company: "Empresa não identificada", status: "", city: "", state: "" };
+    }
+  }
+
+  // Main Functions
+  async function inspectDomain(domain) {
+    const clues = [];
+    
+    for (const path of COMMON_PATHS) {
+      const html = await fetchPage(domain, path);
+      if (!html || html.length < 80) continue;
+
+      const cnpjs = extractCnpjs(html);
+      const organization = findOrganization(html);
+      const title = html.match(/<title>([^<]+)<\/title>/)?.[1] || organization || domain;
+      
+      clues.push({
+        path,
+        label: path === "/" ? "Principal" : path.replace(/\//g, "").toUpperCase(),
+        title,
+        organization,
+        cnpjs: cnpjs.map(cnpj => ({ raw: cnpj, formatted: cnpj })),
+        sourceUrl: `http://${domain}${path}`,
+        body: html.substring(0, 200),
+      });
+    }
+    
+    return clues;
+  }
+
+  async function analyzeDomain(domain) {
+    const normalized = normalizeDomain(domain);
+    if (!normalized) {
+      alert("Domínio inválido");
+      return;
+    }
+
+    setStatus("Pesquisando...", true);
+
+    try {
+      const [mxRecords, clues] = await Promise.all([
+        lookupMx(normalized.rootDomain),
+        inspectDomain(normalized.rootDomain),
+      ]);
+
+      const allCnpjs = clues.flatMap(c => c.cnpjs);
+      const uniqueCnpjs = [...new Map(allCnpjs.map(c => [c.formatted, c])).values()];
+      const enrichedCnpjs = await Promise.all(
+        uniqueCnpjs.map(async cnpj => ({
+          ...cnpj,
+          ...await enrichCnpj(cnpj.formatted),
+        }))
+      );
+
+      const organization = clues.find(c => c.organization)?.organization || null;
+      
+      renderResults(normalized, mxRecords, enrichedCnpjs, clues, organization);
+      setStatus("Pesquisa concluída com sucesso", false);
+
+    } catch (error) {
+      console.error(error);
+      setStatus("Erro na pesquisa", false);
+    }
+  }
+
+  // Render Functions
+  function setStatus(text, isLoading) {
+    if (!statusPanel) return;
+    
+    if (isLoading) {
+      statusPanel.style.display = "block";
+      if (statusHeading) statusHeading.textContent = text;
+      statusText.style.display = "none";
+      progressContainer.style.display = "block";
+      progressFill.style.width = "30%";
+      progressText.textContent = "Processando...";
+    } else {
+      progressFill.style.width = "100%";
+      progressText.textContent = text;
+      setTimeout(() => {
+        statusPanel.style.display = "block";
+        if (statusHeading) statusHeading.textContent = text;
+        statusText.style.display = "block";
+        progressContainer.style.display = "none";
+      }, 500);
+    }
+  }
+
+  function updateSummary(domain, organization, cnpjCount, mxCount) {
+    if (!summaryList) return;
+    const dds = summaryList.querySelectorAll("dd");
+    if (dds.length >= 4) {
+      dds[0].textContent = domain.displayDomain;
+      dds[1].textContent = domain.rootDomain;
+      dds[2].textContent = organization || "Não identificada";
+      dds[3].textContent = cnpjCount;
+    }
+  }
+
+  function renderResults(domain, mxRecords, cnpjs, clues, organization) {
+    if (!mxResults || !cnpjResults || !clueResults) return;
+
+    // Summary
+    updateSummary(domain, organization, cnpjs.length, mxRecords.length);
+
+    // MX
+    mxResults.innerHTML = "";
+    if (mxRecords.length === 0) {
+      mxResults.classList.add("empty-state");
+      mxResults.textContent = "Nenhum registro MX encontrado";
+    } else {
+      mxResults.classList.remove("empty-state");
+      mxRecords.forEach(record => {
+        if (!mxTemplate) return;
+        const fragment = mxTemplate.content.cloneNode(true);
+        const hostEl = fragment.querySelector("[data-host]");
+        const priorityEl = fragment.querySelector("[data-priority]");
+        const metaEl = fragment.querySelector("[data-meta]");
+        
+        if (hostEl) hostEl.textContent = record.host;
+        if (priorityEl) priorityEl.textContent = `Prioridade ${record.priority}`;
+        if (metaEl) metaEl.textContent = `TTL: ${record.ttl}s • ${record.provider}`;
+        
+        mxResults.appendChild(fragment);
+      });
+    }
+
+    // CNPJs
+    cnpjResults.innerHTML = "";
+    if (cnpjs.length === 0) {
+      cnpjResults.classList.add("empty-state");
+      cnpjResults.textContent = "Nenhum CNPJ encontrado";
+    } else {
+      cnpjResults.classList.remove("empty-state");
+      cnpjs.forEach(cnpj => {
+        if (!cnpjTemplate) return;
+        const fragment = cnpjTemplate.content.cloneNode(true);
+        
+        const cnpjEl = fragment.querySelector("[data-cnpj]");
+        const sourceEl = fragment.querySelector("[data-source]");
+        const companyEl = fragment.querySelector("[data-company]");
+        const extraEl = fragment.querySelector("[data-extra]");
+        
+        if (cnpjEl) cnpjEl.textContent = cnpj.formatted;
+        if (sourceEl) sourceEl.textContent = "Evidência pública";
+        if (companyEl) companyEl.textContent = cnpj.company;
+        
+        const meta = [];
+        if (cnpj.status) meta.push(cnpj.status);
+        if (cnpj.city) meta.push(`${cnpj.city}/${cnpj.state}`);
+        if (extraEl) extraEl.textContent = meta.join(" • ") || "Sem dados";
+        
+        cnpjResults.appendChild(fragment);
+      });
+    }
+
+    // Clues
+    clueResults.innerHTML = "";
+    if (clues.length === 0) {
+      clueResults.classList.add("empty-state");
+      clueResults.textContent = "Nenhuma pista encontrada";
+    } else {
+      clueResults.classList.remove("empty-state");
+      clues.forEach(clue => {
+        if (!clueTemplate) return;
+        const fragment = clueTemplate.content.cloneNode(true);
+        
+        const labelEl = fragment.querySelector("[data-label]");
+        const titleEl = fragment.querySelector("[data-title]");
+        const bodyEl = fragment.querySelector("[data-body]");
+        const linkEl = fragment.querySelector("[data-link]");
+        
+        if (labelEl) labelEl.textContent = clue.label;
+        if (titleEl) titleEl.textContent = clue.title;
+        if (bodyEl) bodyEl.textContent = clue.body.substring(0, 150) + "...";
+        if (linkEl) {
+          linkEl.href = clue.sourceUrl;
+          linkEl.textContent = "Abrir fonte";
+        }
+        
+        clueResults.appendChild(fragment);
+      });
+    }
+  }
+
+  // Batch Processing
+  async function processBatch(domains) {
+    if (!batchResultsSection || !batchResults) return;
+
+    batchResultsSection.style.display = "block";
+    batchResults.innerHTML = "";
+    setStatus(`Processando ${domains.length} domínios...`, true);
+
+    const results = [];
+
+    for (let i = 0; i < domains.length; i++) {
+      const domain = domains[i];
+      progressFill.style.width = `${(i / domains.length) * 100}%`;
+      progressText.textContent = `${i + 1}/${domains.length} - ${domain}`;
+
+      try {
+        const [mxRecords, clues] = await Promise.all([
+          lookupMx(domain),
+          inspectDomain(domain),
+        ]);
+
+        const cnpjsAll = clues.flatMap(c => c.cnpjs);
+        const uniqueCnpjs = [...new Map(cnpjsAll.map(c => [c.formatted, c])).values()];
+        const enrichedCnpjs = await Promise.all(
+          uniqueCnpjs.slice(0, 3).map(async cnpj => ({
+            ...cnpj,
+            ...await enrichCnpj(cnpj.formatted),
+          }))
+        );
+
+        const organization = clues.find(c => c.organization)?.organization || null;
+
+        results.push({
+          domain,
+          mxCount: mxRecords.length,
+          cnpjCount: enrichedCnpjs.length,
+          organization,
+          cnpjs: enrichedCnpjs,
+          status: enrichedCnpjs.length > 0 ? "success" : "warning",
+        });
+      } catch (error) {
+        results.push({
+          domain,
+          mxCount: 0,
+          cnpjCount: 0,
+          organization: null,
+          cnpjs: [],
+          status: "error",
+        });
+      }
+
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    renderBatchResults(results);
+    setStatus(`${domains.length} domínios processados`, false);
+  }
+
+  function renderBatchResults(results) {
+    if (!batchResults) return;
+
+    batchResults.innerHTML = "";
+    results.forEach(result => {
+      if (!batchTemplate) return;
+      const fragment = batchTemplate.content.cloneNode(true);
+      
+      const domainEl = fragment.querySelector("[data-domain]");
+      const statusEl = fragment.querySelector("[data-status]");
+      const mxEl = fragment.querySelector("[data-mx-count]");
+      const cnpjEl = fragment.querySelector("[data-cnpj-count]");
+      const orgEl = fragment.querySelector("[data-organization]");
+      const cnpjListEl = fragment.querySelector("[data-cnpj-list]");
+      const cnpjFormattedEl = fragment.querySelector("[data-cnpj-formatted]");
+      
+      if (domainEl) domainEl.textContent = result.domain;
+      if (mxEl) mxEl.textContent = result.mxCount;
+      if (cnpjEl) cnpjEl.textContent = result.cnpjCount;
+      if (orgEl) orgEl.textContent = result.organization || "-";
+      
+      if (statusEl) {
+        statusEl.textContent = result.status === "success" ? "✓ OK" : result.status === "warning" ? "⚠ Parcial" : "✗ Erro";
+        statusEl.className = `batch-status ${result.status}`;
+      }
+      
+      if (result.cnpjs.length > 0) {
+        if (cnpjListEl) cnpjListEl.style.display = "flex";
+        if (cnpjFormattedEl) cnpjFormattedEl.textContent = result.cnpjs.map(c => c.formatted).join(", ");
+      }
+      
+      batchResults.appendChild(fragment);
+    });
+  }
+
+  // CSV Parsing
+  async function parseCsvFile(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        try {
+          const text = e.target.result;
+          const lines = text
+            .split("\n")
+            .map(l => l.trim())
+            .filter(l => l && l.includes("."));
+
+          const domains = lines.map(line => {
+            try {
+              const url = new URL(line.startsWith("http") ? line : `http://${line}`);
+              return url.hostname;
+            } catch {
+              return line;
+            }
+          }).filter(d => normalizeDomain(d));
+
+          resolve([...new Set(domains)]);
+        } catch (error) {
+          reject(new Error("Erro ao ler arquivo: " + error.message));
+        }
+      };
+      reader.onerror = () => reject(new Error("Erro ao ler arquivo"));
+      reader.readAsText(file);
+    });
+  }
+
+  // Event Listeners
+  if (form) {
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      if (input.value.trim()) {
+        analyzeDomain(input.value.trim());
+        input.value = "";
+      }
+    });
+  }
+
+  if (uploadLabel) {
+    uploadLabel.addEventListener("click", (e) => {
+      if (csvUpload && e.target === uploadLabel) {
+        csvUpload.click();
+      }
+    });
+  }
+
+  if (csvUpload) {
+    csvUpload.addEventListener("change", async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      try {
+        const domains = await parseCsvFile(file);
+        if (domains.length === 0) {
+          alert("Nenhum domínio válido encontrado");
+          return;
+        }
+        await processBatch(domains);
+      } catch (error) {
+        alert("Erro: " + error.message);
+      }
+    });
+  }
+
+  console.log("✓ App inicializado com sucesso");
+});
+const DNS_ENDPOINT = "https://dns.google/resolve";
+const BRASIL_API = "https://brasilapi.com.br/api/cnpj/v1/";
+const JINA_PROXY = "https://r.jina.ai/";
+
+const COMMON_PATHS = ["/", "/contato", "/sobre", "/empresa", "/quem-somos", "/institucional"];
+const BR_SECOND_LEVEL = new Set(["com.br", "co.br", "gov.br", "edu.br", "org.br", "net.br", "jus.br"]);
+
 // DOM Elements
 const form = document.querySelector("#lookup-form");
 const input = document.querySelector("#domain-input");
 const csvUpload = document.querySelector("#csv-upload");
+const uploadLabel = document.querySelector(".upload-label");
 
 const statusPanel = document.querySelector("#status-panel");
 const statusText = document.querySelector("#status-text");
-const statusHeading = statusPanel.querySelector("h2");
+const statusHeading = statusPanel?.querySelector("h2");
 const progressContainer = document.querySelector("#progress-container");
 const progressFill = document.querySelector("#progress-fill");
 const progressText = document.querySelector("#progress-text");
