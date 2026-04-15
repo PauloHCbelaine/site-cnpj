@@ -247,17 +247,346 @@ body {
   border: 0;
 }
 
-@media (max-width: 860px) {
-  .panel,
-  .panel-wide {
-    grid-column: span 12;
+/* Tablets e monitores menores */
+@media (max-width: 1024px) {
+  .page-shell {
+    width: min(100%, calc(100% - 24px));
+    padding: 32px 0 48px;
   }
 
   .hero {
-    padding: 24px;
+    padding: 28px;
+  }
+
+  .hero h1 {
+    font-size: clamp(2rem, 6vw, 4rem);
+  }
+
+  .results-grid {
+    gap: 16px;
+    margin-top: 20px;
+  }
+
+  .panel {
+    padding: 20px;
+  }
+
+  .quick-notes {
+    gap: 8px;
+  }
+
+  .quick-notes span,
+  .badge {
+    min-height: 30px;
+    padding: 0 10px;
+    font-size: 0.85rem;
+  }
+}
+
+/* Tablets em modo portrait e telefones em modo landscape */
+@media (max-width: 768px) {
+  .page-shell {
+    padding: 24px 0 40px;
+  }
+
+  .hero {
+    padding: 20px;
+    border-radius: 20px;
+  }
+
+  .eyebrow,
+  .panel-kicker,
+  .clue-label {
+    margin: 0 0 8px;
+    font-size: 0.7rem;
+    letter-spacing: 0.12em;
+  }
+
+  .hero h1 {
+    max-width: none;
+    font-size: clamp(1.75rem, 5vw, 2.5rem);
+    margin-bottom: 12px;
+  }
+
+  .hero-copy {
+    font-size: 1rem;
+    max-width: 100%;
+    margin-top: 14px;
+    line-height: 1.5;
+  }
+
+  .lookup-form {
+    gap: 10px;
+    margin-top: 22px;
+  }
+
+  .lookup-form input,
+  .lookup-form button {
+    min-height: 52px;
+    border-radius: 14px;
+    font-size: 16px;
+  }
+
+  .lookup-form input {
+    padding: 0 14px;
+  }
+
+  .lookup-form button {
+    padding: 0 18px;
+    font-size: 0.95rem;
+  }
+
+  .quick-notes {
+    margin-top: 16px;
+    gap: 6px;
+  }
+
+  .quick-notes span,
+  .badge {
+    min-height: 28px;
+    padding: 0 10px;
+    font-size: 0.8rem;
+    border-radius: 8px;
+  }
+
+  .results-grid {
+    gap: 14px;
+    margin-top: 18px;
+  }
+
+  .panel {
+    grid-column: span 12;
+    padding: 16px;
+    border-radius: 18px;
+  }
+
+  .panel-heading {
+    margin-bottom: 14px;
+  }
+
+  .panel h2 {
+    font-size: 1.2rem;
+  }
+
+  .summary-list {
+    gap: 12px;
+  }
+
+  .summary-list div {
+    padding-bottom: 12px;
+  }
+
+  .summary-list dt {
+    font-size: 0.8rem;
+  }
+
+  .summary-list dd {
+    font-size: 0.95rem;
+    margin-top: 6px;
+  }
+
+  .stack-list,
+  .clue-grid {
+    gap: 12px;
+  }
+
+  .card-item,
+  .clue-card {
+    padding: 12px;
+    border-radius: 14px;
+  }
+
+  .card-item-header {
+    gap: 10px;
+    margin-bottom: 8px;
+  }
+
+  .card-item-header strong {
+    font-size: 0.95rem;
+    word-break: break-word;
+  }
+
+  .card-item p,
+  .clue-card p {
+    font-size: 0.9rem;
+    line-height: 1.5;
+  }
+
+  .clue-card strong {
+    font-size: 0.95rem;
+    margin: 2px 0 6px;
+  }
+
+  .clue-grid {
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  }
+
+  .clue-card a {
+    font-size: 0.85rem;
+    margin-top: 10px;
+  }
+}
+
+/* Telefones - pequenas telas */
+@media (max-width: 480px) {
+  .page-shell {
+    width: 100%;
+    padding: 16px 0 32px;
+  }
+
+  body {
+    padding: 0;
+  }
+
+  .hero {
+    padding: 16px;
+    border-radius: 16px;
+    margin: 0 12px;
+    box-shadow: 0 8px 20px rgba(40, 31, 16, 0.1);
+  }
+
+  .eyebrow,
+  .panel-kicker,
+  .clue-label {
+    font-size: 0.65rem;
+    letter-spacing: 0.1em;
+    margin-bottom: 6px;
+  }
+
+  .hero h1 {
+    font-size: clamp(1.4rem, 4vw, 2rem);
+    max-width: none;
+    margin-bottom: 10px;
+  }
+
+  .hero-copy {
+    font-size: 0.9rem;
+    margin-top: 10px;
+    line-height: 1.4;
   }
 
   .lookup-form {
     grid-template-columns: 1fr;
+    gap: 8px;
+    margin-top: 16px;
+  }
+
+  .lookup-form input,
+  .lookup-form button {
+    min-height: 48px;
+    border-radius: 12px;
+    font-size: 16px;
+  }
+
+  .lookup-form input {
+    padding: 0 12px;
+  }
+
+  .lookup-form button {
+    padding: 0 16px;
+    font-weight: 600;
+    font-size: 0.95rem;
+  }
+
+  .quick-notes {
+    margin-top: 12px;
+    gap: 4px;
+    flex-wrap: wrap;
+  }
+
+  .quick-notes span,
+  .badge {
+    min-height: 26px;
+    padding: 0 8px;
+    font-size: 0.75rem;
+    border-radius: 6px;
+  }
+
+  .results-grid {
+    gap: 10px;
+    margin-top: 14px;
+    margin-left: 12px;
+    margin-right: 12px;
+  }
+
+  .panel,
+  .panel-wide {
+    grid-column: span 12;
+    padding: 12px;
+    border-radius: 14px;
+  }
+
+  .panel-heading {
+    margin-bottom: 12px;
+  }
+
+  .panel h2 {
+    font-size: 1.05rem;
+    margin-bottom: 4px;
+  }
+
+  .summary-list {
+    gap: 10px;
+  }
+
+  .summary-list div {
+    padding-bottom: 10px;
+  }
+
+  .summary-list dt {
+    font-size: 0.75rem;
+  }
+
+  .summary-list dd {
+    font-size: 0.9rem;
+    font-weight: 500;
+    margin-top: 4px;
+  }
+
+  .stack-list,
+  .clue-grid {
+    gap: 10px;
+  }
+
+  .card-item,
+  .clue-card {
+    padding: 10px;
+    border-radius: 12px;
+  }
+
+  .card-item-header {
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 8px;
+    align-items: flex-start;
+  }
+
+  .card-item-header strong,
+  .card-item-header .badge {
+    word-break: break-word;
+  }
+
+  .card-item p,
+  .clue-card p {
+    font-size: 0.85rem;
+    line-height: 1.4;
+  }
+
+  .clue-card strong {
+    font-size: 0.9rem;
+    margin: 2px 0 4px;
+  }
+
+  .clue-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .clue-card a {
+    font-size: 0.8rem;
+    margin-top: 8px;
+  }
+
+  .muted {
+    font-size: 0.8rem;
   }
 }

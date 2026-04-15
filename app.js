@@ -119,13 +119,37 @@ async function lookupMx(domain) {
   return answers
     .map((record) => {
       const [priority, ...hostParts] = String(record.data).split(" ");
+      const host = hostParts.join(" ").replace(/\.$/, "");
       return {
-        host: hostParts.join(" ").replace(/\.$/, ""),
+        host,
         priority,
         ttl: record.TTL,
+        provider: classifyMxProvider(host),
       };
     })
     .filter((record) => record.host);
+}
+
+function classifyMxProvider(host) {
+  const normalized = host.toLowerCase();
+  
+  const providers = {
+    "Google Workspace": ["aspmx.l.google.com", "google.com"],
+    "Microsoft 365": ["outlook.com", "hotmail.com", "microsoft.com"],
+    "Zoho Mail": ["zoho.com"],
+    "Amazon SES": ["amazonses.com"],
+    "SendGrid": ["sendgrid.com"],
+    "Mailgun": ["mailgun.org", "mailgun.com"],
+    "AWS": ["awsemailsupport.com"],
+  };
+  
+  for (const [provider, domains] of Object.entries(providers)) {
+    if (domains.some(d => normalized.includes(d))) {
+      return provider;
+    }
+  }
+  
+  return "Provedor desconhecido";
 }
 
 async function inspectDomain(domain) {
@@ -178,7 +202,8 @@ function parseClue(text, sourceUrl) {
 
 function extractCnpjs(text) {
   const matches = text.match(/\b\d{2}[.\s]?\d{3}[.\s]?\d{3}[\/\s]?\d{4}[-\s]?\d{2}\b/g) || [];
-  return matches.filter((value, index, array) => array.indexOf(value) === index);
+  const unique = matches.filter((value, index, array) => array.indexOf(value) === index);
+  return unique.filter(cnpj => validateCnpj(cnpj));
 }
 
 function findOrganization(text) {
@@ -275,7 +300,7 @@ function renderMx(records) {
     const fragment = mxTemplate.content.cloneNode(true);
     fragment.querySelector("[data-host]").textContent = record.host;
     fragment.querySelector("[data-priority]").textContent = `Prioridade ${record.priority}`;
-    fragment.querySelector("[data-meta]").textContent = `TTL informado: ${record.ttl}s`;
+    fragment.querySelector("[data-meta]").textContent = `TTL: ${record.ttl}s • ${record.provider}`;
     mxResults.appendChild(fragment);
   });
 }
@@ -350,6 +375,45 @@ function formatCnpj(value) {
   }
 
   return digits.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, "$1.$2.$3/$4-$5");
+}
+
+function validateCnpj(value) {
+  const digits = onlyDigits(value);
+  
+  if (digits.length !== 14) {
+    return false;
+  }
+  
+  // Rejeita sequencias repetidas
+  if (/^(\d)\1{13}$/.test(digits)) {
+    return false;
+  }
+  
+  // Calcula primeiro digito verificador
+  let sum = 0;
+  let multiplier = 5;
+  for (let i = 0; i < 8; i++) {
+    sum += parseInt(digits[i]) * multiplier;
+    multiplier = multiplier === 2 ? 9 : multiplier - 1;
+  }
+  let remainder = sum % 11;
+  const firstDigit = remainder < 2 ? 0 : 11 - remainder;
+  
+  if (parseInt(digits[8]) !== firstDigit) {
+    return false;
+  }
+  
+  // Calcula segundo digito verificador
+  sum = 0;
+  multiplier = 6;
+  for (let i = 0; i < 9; i++) {
+    sum += parseInt(digits[i]) * multiplier;
+    multiplier = multiplier === 2 ? 9 : multiplier - 1;
+  }
+  remainder = sum % 11;
+  const secondDigit = remainder < 2 ? 0 : 11 - remainder;
+  
+  return parseInt(digits[9]) === secondDigit;
 }
 
 function uniqueBy(items, selector) {
