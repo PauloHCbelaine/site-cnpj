@@ -1,7 +1,7 @@
 const DNS_ENDPOINT = "https://dns.google/resolve";
 const CONTENT_PROXY = "https://r.jina.ai/http://";
 const BRASIL_API = "https://brasilapi.com.br/api/cnpj/v1/";
-const COMMON_PATHS = ["/", "/contato", "/contato/", "/sobre", "/sobre/", "/empresa", "/empresa/", "/quem-somos", "/institucional"];
+const COMMON_PATHS = ["/", "/contato", "/contato/", "/sobre", "/sobre/", "/empresa", "/empresa/", "/quem-somos", "/institucional", "/footer", "/rodape"];
 const BR_SECOND_LEVEL_DOMAINS = new Set([
   "com.br",
   "org.br",
@@ -31,16 +31,24 @@ const BR_SECOND_LEVEL_DOMAINS = new Set([
 
 const form = document.querySelector("#lookup-form");
 const input = document.querySelector("#domain-input");
+const csvUpload = document.querySelector("#csv-upload");
+const uploadLabel = document.querySelector(".upload-label");
 const statusPanelTitle = document.querySelector("#status-panel h2");
 const statusText = document.querySelector("#status-text");
 const mxResults = document.querySelector("#mx-results");
 const cnpjResults = document.querySelector("#cnpj-results");
 const clueResults = document.querySelector("#clue-results");
 const summaryList = document.querySelector("#summary-list");
+const progressContainer = document.querySelector("#progress-container");
+const progressFill = document.querySelector("#progress-fill");
+const progressText = document.querySelector("#progress-text");
+const batchResultsSection = document.querySelector("#batch-results-section");
+const batchResults = document.querySelector("#batch-results");
 
 const mxTemplate = document.querySelector("#mx-item-template");
 const cnpjTemplate = document.querySelector("#cnpj-item-template");
 const clueTemplate = document.querySelector("#clue-item-template");
+const batchTemplate = document.querySelector("#batch-item-template");
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -53,13 +61,16 @@ form.addEventListener("submit", async (event) => {
     return;
   }
 
-  prepareLoadingState(normalized.displayDomain);
+  batchResultsSection.style.display = "none";
+  prepareLoadingState(normalized.displayDomain, 1);
 
   try {
     const [mxRecords, clues] = await Promise.all([
       lookupMx(normalized.rootDomain),
       inspectDomain(normalized.rootDomain),
     ]);
+
+    updateProgress(100, "Processando resultados...");
 
     const cnpjs = uniqueBy(clues.flatMap((clue) => clue.cnpjs), (item) => item.formatted);
     const enrichedCnpjs = await enrichCnpjs(cnpjs);
@@ -75,6 +86,7 @@ form.addEventListener("submit", async (event) => {
         ? `Encontramos sinais de ${organization}, ${enrichedCnpjs.length} CNPJ(s) candidato(s) e ${mxRecords.length} registro(s) MX para ${normalized.rootDomain}.`
         : `Coleta finalizada para ${normalized.rootDomain} com ${mxRecords.length} registro(s) MX e ${enrichedCnpjs.length} CNPJ(s) candidato(s).`
     );
+    hideProgress();
   } catch (error) {
     console.error(error);
     setStatus(
@@ -84,8 +96,31 @@ form.addEventListener("submit", async (event) => {
     mxResults.textContent = "A consulta de MX nao retornou dados.";
     cnpjResults.textContent = "A pesquisa de CNPJ nao retornou dados.";
     clueResults.textContent = "Nao foi possivel carregar pistas do site.";
+    hideProgress();
   }
 });
+
+csvUpload.addEventListener("change", async (event) => {
+  const file = event.target.files[0];
+  if (!file) return;
+
+  batchResultsSection.style.display = "none";
+  try {
+    const domains = await parseCsvFile(file);
+    
+    if (!domains || domains.length === 0) {
+      setStatus("Erro na planilha", "Nenhum dominio encontrado. Verifique o formato do arquivo.");
+      return;
+    }
+
+    await processBatch(domains);
+  } catch (error) {
+    console.error(error);
+    setStatus("Erro ao processar", `Erro ao ler o arquivo: ${error.message}`);
+  }
+});
+
+uploadLabel.addEventListener("click", () => csvUpload.click());
 
 function normalizeDomain(value) {
   const cleaned = value
@@ -348,11 +383,12 @@ function renderClues(clues) {
   });
 }
 
-function prepareLoadingState(domain) {
+function prepareLoadingState(domain, totalItems = 1) {
   setStatus("Coletando dados", `Consultando MX, paginas principais e possiveis CNPJs publicados para ${domain}.`);
   mxResults.textContent = "Buscando registros MX...";
   cnpjResults.textContent = "Varrendo paginas por possiveis CNPJs...";
   clueResults.textContent = "Reunindo pistas institucionais...";
+  showProgress(totalItems);
 }
 
 function setStatus(title, description) {
@@ -425,5 +461,164 @@ function uniqueBy(items, selector) {
     }
     seen.add(key);
     return true;
+  });
+}
+
+function showProgress(totalItems = 1) {
+  progressContainer.style.display = "block";
+  statusText.style.display = "none";
+  updateProgress(0, `Processando 0 de ${totalItems}...`);
+}
+
+function hideProgress() {
+  progressContainer.style.display = "none";
+  statusText.style.display = "block";
+}
+
+function updateProgress(percent, text) {
+  progressFill.style.width = percent + "%";
+  progressText.textContent = text;
+}
+
+async function parseCsvFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const text = e.target.result;
+        let lines = [];
+        
+        // Se for XLSX, tenta interpretar como CSV básico
+        if (file.name.endsWith('.xlsx')) {
+          // Nota: Para XLSX completo, seria necessário usar uma biblioteca como xlsx
+          // Por enquanto, tentamos extrair URLs básicas
+          lines = text.split('\n')
+            .map(line => line.trim())
+            .filter(line => line.length > 0 && (line.includes('.') || line.match(/^https?:/)));
+        } else {
+          // CSV parsing
+          lines = text.split('\n')
+            .map(line => {
+              // Remove aspas se existirem
+              return line.replace(/^["']|["']$/g, '').trim();
+            })
+            .filter(line => line.length > 0);
+        }
+
+        // Normaliza e valida domínios
+        const domains = lines
+          .map(line => {
+            // Extrai domínio se for URL completa
+            if (line.includes('://')) {
+              return new URL(line).hostname;
+            }
+            return line;
+          })
+          .filter(domain => domain && domain.includes('.'))
+          .map(domain => normalizeDomain(domain))
+          .filter(Boolean)
+          .map(d => d.rootDomain);
+
+        // Remove duplicatas
+        const unique = [...new Set(domains)];
+        resolve(unique);
+      } catch (error) {
+        reject(new Error(`Erro ao ler arquivo: ${error.message}`));
+      }
+    };
+    reader.onerror = () => reject(new Error('Erro ao ler o arquivo'));
+    reader.readAsText(file);
+  });
+}
+
+async function processBatch(domains) {
+  batchResults.innerHTML = "";
+  batchResultsSection.style.display = "block";
+  mxResults.innerHTML = "";
+  cnpjResults.innerHTML = "";
+  clueResults.innerHTML = "";
+  
+  prepareLoadingState(`${domains.length} domínios`, domains.length);
+
+  const results = [];
+  
+  for (let i = 0; i < domains.length; i++) {
+    const domain = domains[i];
+    updateProgress(Math.floor((i / domains.length) * 100), `Processando ${i + 1} de ${domains.length}: ${domain}`);
+    
+    try {
+      const [mxRecords, clues] = await Promise.all([
+        lookupMx(domain).catch(() => []),
+        inspectDomain(domain).catch(() => []),
+      ]);
+
+      const cnpjs = uniqueBy(clues.flatMap((clue) => clue.cnpjs), (item) => item.formatted);
+      const enrichedCnpjs = await enrichCnpjs(cnpjs);
+      const organization = clues.find((clue) => clue.organization)?.organization || inferOrganization(clues);
+
+      results.push({
+        domain,
+        mxCount: mxRecords.length,
+        cnpjCount: enrichedCnpjs.length,
+        organization,
+        cnpjs: enrichedCnpjs,
+        error: false,
+      });
+    } catch (error) {
+      console.error(`Erro ao processar ${domain}:`, error);
+      results.push({
+        domain,
+        mxCount: 0,
+        cnpjCount: 0,
+        organization: null,
+        cnpjs: [],
+        error: true,
+      });
+    }
+    
+    // Delay entre requisições para evitar rate limit
+    if (i < domains.length - 1) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+  }
+
+  updateProgress(100, "Renderizando resultados...");
+  renderBatchResults(results);
+  
+  setStatus(
+    "Análise em lote concluída",
+    `${domains.length} domínios processados. ${results.filter(r => !r.error).length} sucessos, ${results.filter(r => r.error).length} erros.`
+  );
+  
+  hideProgress();
+}
+
+function renderBatchResults(results) {
+  batchResults.innerHTML = "";
+
+  results.forEach((result) => {
+    const fragment = batchTemplate.content.cloneNode(true);
+    
+    fragment.querySelector("[data-domain]").textContent = result.domain;
+    
+    const statusBadge = fragment.querySelector("[data-status]");
+    statusBadge.textContent = result.error ? "Erro" : "OK";
+    if (result.error) {
+      statusBadge.classList.add("error");
+    }
+    
+    fragment.querySelector("[data-mx-count]").textContent = result.mxCount;
+    fragment.querySelector("[data-cnpj-count]").textContent = result.cnpjCount;
+    fragment.querySelector("[data-organization]").textContent = result.organization || "-";
+    
+    if (result.cnpjs.length > 0) {
+      const cnpjListRow = fragment.querySelector("[data-cnpj-list]");
+      cnpjListRow.style.display = "flex";
+      fragment.querySelector("[data-cnpj-formatted]").textContent = result.cnpjs
+        .map(c => c.formatted || c.raw)
+        .join(", ");
+    }
+    
+    batchResults.appendChild(fragment);
   });
 }

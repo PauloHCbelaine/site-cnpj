@@ -23,6 +23,16 @@
         <input id="domain-input" name="domain" type="text" placeholder="ex.: empresa.com.br" autocomplete="off" spellcheck="false" required>
         <button type="submit">Analisar dominio</button>
       </form>
+      
+      <div class="upload-section">
+        <label for="csv-upload" class="upload-label">
+          <span class="upload-icon">📊</span>
+          Carregar planilha (.csv ou .xlsx)
+        </label>
+        <input id="csv-upload" type="file" accept=".csv,.xlsx" hidden>
+        <p class="upload-hint">Formato: coluna com URLs ou domínios</p>
+      </div>
+
       <div class="quick-notes">
         <span>Sem backend</span>
         <span>MX via DNS-over-HTTPS</span>
@@ -35,6 +45,12 @@
         <div class="panel-heading">
           <p class="panel-kicker">Status</p>
           <h2>Pronto para pesquisar</h2>
+        </div>
+        <div class="progress-container" id="progress-container" style="display: none;">
+          <div class="progress-bar">
+            <div class="progress-fill" id="progress-fill"></div>
+          </div>
+          <p class="progress-text" id="progress-text"></p>
         </div>
         <p id="status-text">
           Informe um dominio principal para iniciar a coleta de MX, metadados institucionais e possiveis CNPJs publicados no proprio site.
@@ -95,6 +111,14 @@
           As evidencias encontradas no site aparecerao aqui.
         </div>
       </section>
+
+      <section class="panel panel-wide" id="batch-results-section" style="display: none;">
+        <div class="panel-heading">
+          <p class="panel-kicker">Resultados em Lote</p>
+          <h2>Análise de múltiplos domínios</h2>
+        </div>
+        <div id="batch-results" class="batch-results-container"></div>
+      </section>
     </main>
   </div>
 
@@ -126,6 +150,33 @@
       <p data-body></p>
       <a data-link target="_blank" rel="noreferrer noopener">Abrir fonte</a>
     </article>
+  </template>
+
+  <template id="batch-item-template">
+    <div class="batch-item">
+      <div class="batch-item-header">
+        <strong class="batch-domain" data-domain></strong>
+        <span class="batch-status" data-status></span>
+      </div>
+      <div class="batch-data">
+        <div class="batch-data-row">
+          <span class="batch-label">MX encontrados:</span>
+          <span class="batch-value" data-mx-count>0</span>
+        </div>
+        <div class="batch-data-row">
+          <span class="batch-label">CNPJs válidos:</span>
+          <span class="batch-value" data-cnpj-count>0</span>
+        </div>
+        <div class="batch-data-row">
+          <span class="batch-label">Organização:</span>
+          <span class="batch-value" data-organization>-</span>
+        </div>
+        <div class="batch-data-row" data-cnpj-list style="display: none;">
+          <span class="batch-label">CNPJs:</span>
+          <span class="batch-value" data-cnpj-formatted></span>
+        </div>
+      </div>
+    </div>
   </template>
 
   <script src="app.js" type="module"></script>
