@@ -3,173 +3,127 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Radar de Domínio e CNPJ</title>
+  <title>Radar CNPJ</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <div class="page-shell">
-    <header class="hero">
-      <div class="hero-top">
-        <h1>Radar CNPJ</h1>
-        <p class="hero-subtitle">Descubra MX e CNPJ de um dominio</p>
-      </div>
-      
-      <form id="lookup-form" class="lookup-form">
-        <label for="domain-input" class="sr-only">Digite o dominio</label>
-        <input id="domain-input" name="domain" type="text" placeholder="ex.: empresa.com.br" autocomplete="off" spellcheck="false" required>
-        <button type="submit">Analisar</button>
-      </form>
-      
-      <div class="hero-actions">
-        <label for="csv-upload" class="upload-link">
-          📊 Carregar CSV/XLSX
-        </label>
-        <input id="csv-upload" type="file" accept=".csv,.xlsx" hidden>
+  <div class="page-wrapper">
+    <header class="header-hero">
+      <div class="header-content">
+        <div class="header-badge">🔍 Inteligência de Domínios</div>
+        <h1 class="header-title">Radar CNPJ</h1>
+        <p class="header-subtitle">Descubra o CNPJ, infraestrutura de email e dados da empresa por domínio</p>
       </div>
     </header>
 
-    <main class="results-grid">
-      <section class="panel panel-highlight" id="status-panel">
-        <div class="panel-heading">
-          <p class="panel-kicker">Status</p>
-          <h2>Pronto para pesquisar</h2>
-        </div>
-        <div class="progress-container" id="progress-container" style="display: none;">
-          <div class="progress-bar">
-            <div class="progress-fill" id="progress-fill"></div>
+    <main class="container">
+      <div class="search-section">
+        <form id="lookup-form" class="search-form">
+          <div class="input-group">
+            <input id="domain-input" type="text" placeholder="Exemplo: google.com" required>
+            <button type="submit" class="btn-primary">Pesquisar</button>
           </div>
-          <p class="progress-text" id="progress-text"></p>
-        </div>
-        <p id="status-text">
-          Informe um dominio principal para iniciar a coleta de MX, metadados institucionais e possiveis CNPJs publicados no proprio site.
-        </p>
-      </section>
+        </form>
+        <label class="btn-secondary">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path>
+            <polyline points="13 2 13 9 20 9"></polyline>
+          </svg>
+          Importar CSV/XLSX
+          <input id="csv-upload" type="file" accept=".csv,.xlsx" hidden>
+        </label>
+      </div>
 
-      <section class="panel">
-        <div class="panel-heading">
-          <p class="panel-kicker">Resumo</p>
-          <h2>Visao geral</h2>
+      <div id="status-panel" class="status-banner" style="display: none;">
+        <span id="status-text"></span>
+        <div id="progress-container" class="progress-bar" style="display: none;">
+          <div id="progress-fill"></div>
         </div>
-        <dl id="summary-list" class="summary-list">
-          <div>
-            <dt>Dominio analisado</dt>
-            <dd>-</dd>
+      </div>
+
+      <div id="results-container" style="display: none;" class="results-grid">
+        <div class="result-card domain-card">
+          <div class="result-header">
+            <h2>Domínio</h2>
+            <div class="icon-badge">🌐</div>
           </div>
-          <div>
-            <dt>Dominio principal</dt>
-            <dd>-</dd>
+          <p id="domain-name" class="domain-value">-</p>
+          <p id="organization-name" class="organization-value">Sem identificação</p>
+        </div>
+
+        <div class="result-card cnpj-card">
+          <div class="result-header">
+            <h2>CNPJ</h2>
+            <div class="icon-badge">📋</div>
           </div>
-          <div>
-            <dt>Organizacao</dt>
-            <dd>-</dd>
+          <div id="cnpj-display" class="result-items">
+            <p class="empty-state">Não encontrado</p>
           </div>
-          <div>
-            <dt>CNPJs encontrados</dt>
-            <dd>-</dd>
+        </div>
+
+        <div class="result-card email-card">
+          <div class="result-header">
+            <h2>Infraestrutura de Email</h2>
+            <div class="icon-badge">✉️</div>
           </div>
-        </dl>
-      </section>
+          <div id="mx-display" class="result-items">
+            <p class="empty-state">Nenhum registro</p>
+          </div>
+        </div>
+      </div>
 
-      <section class="panel">
-        <div class="panel-heading">
-          <p class="panel-kicker">MX</p>
-          <h2>Registros de e-mail</h2>
+      <template id="cnpj-card">
+        <div class="item-card">
+          <div class="item-cnpj" data-cnpj></div>
+          <div class="item-info">
+            <p class="item-company" data-company></p>
+            <p class="item-meta" data-meta></p>
+          </div>
         </div>
-        <div id="mx-results" class="stack-list empty-state">
-          Nenhum lookup executado ainda.
-        </div>
-      </section>
+      </template>
 
-      <section class="panel">
-        <div class="panel-heading">
-          <p class="panel-kicker">CNPJ</p>
-          <h2>Possiveis vinculacoes</h2>
+      <template id="mx-card">
+        <div class="item-card">
+          <div class="item-provider">
+            <strong data-provider></strong>
+          </div>
+          <p class="item-meta" data-details></p>
         </div>
-        <div id="cnpj-results" class="stack-list empty-state">
-          Nenhum CNPJ localizado ate o momento.
-        </div>
-      </section>
+      </template>
 
-      <section class="panel panel-wide">
-        <div class="panel-heading">
-          <p class="panel-kicker">Pistas do site</p>
-          <h2>Fontes e metadados coletados</h2>
+      <template id="batch-item">
+        <div class="batch-card">
+          <div class="batch-top">
+            <span class="batch-domain" data-domain></span>
+            <span class="batch-badge" data-status></span>
+          </div>
+          <div class="batch-data">
+            <div class="batch-field">
+              <span class="batch-label">CNPJ</span>
+              <span class="batch-value" data-cnpj>-</span>
+            </div>
+            <div class="batch-field">
+              <span class="batch-label">Empresa</span>
+              <span class="batch-value" data-company>-</span>
+            </div>
+            <div class="batch-field">
+              <span class="batch-label">Email</span>
+              <span class="batch-value" data-email>-</span>
+            </div>
+          </div>
         </div>
-        <div id="clue-results" class="clue-grid empty-state">
-          As evidencias encontradas no site aparecerao aqui.
-        </div>
-      </section>
+      </template>
 
-      <section class="panel panel-wide" id="batch-results-section" style="display: none;">
-        <div class="panel-heading">
-          <p class="panel-kicker">Resultados em Lote</p>
-          <h2>Análise de múltiplos domínios</h2>
-        </div>
-        <div id="batch-results" class="batch-results-container"></div>
-      </section>
+      <div id="batch-results-container" style="display: none;">
+        <h2 class="batch-title">Resultados da Importação</h2>
+        <div id="batch-results" class="batch-grid"></div>
+      </div>
     </main>
   </div>
 
-  <template id="mx-item-template">
-    <article class="card-item">
-      <div class="card-item-header">
-        <strong data-host></strong>
-        <span class="badge" data-priority></span>
-      </div>
-      <p data-meta></p>
-    </article>
-  </template>
-
-  <template id="cnpj-item-template">
-    <article class="card-item">
-      <div class="card-item-header">
-        <strong data-cnpj></strong>
-        <span class="badge" data-source></span>
-      </div>
-      <p data-company></p>
-      <p class="muted" data-extra></p>
-    </article>
-  </template>
-
-  <template id="clue-item-template">
-    <article class="clue-card">
-      <p class="clue-label" data-label></p>
-      <strong data-title></strong>
-      <p data-body></p>
-      <a data-link target="_blank" rel="noreferrer noopener">Abrir fonte</a>
-    </article>
-  </template>
-
-  <template id="batch-item-template">
-    <div class="batch-item">
-      <div class="batch-item-header">
-        <strong class="batch-domain" data-domain></strong>
-        <span class="batch-status" data-status></span>
-      </div>
-      <div class="batch-data">
-        <div class="batch-data-row">
-          <span class="batch-label">MX encontrados:</span>
-          <span class="batch-value" data-mx-count>0</span>
-        </div>
-        <div class="batch-data-row">
-          <span class="batch-label">CNPJs válidos:</span>
-          <span class="batch-value" data-cnpj-count>0</span>
-        </div>
-        <div class="batch-data-row">
-          <span class="batch-label">Organização:</span>
-          <span class="batch-value" data-organization>-</span>
-        </div>
-        <div class="batch-data-row" data-cnpj-list style="display: none;">
-          <span class="batch-label">CNPJs:</span>
-          <span class="batch-value" data-cnpj-formatted></span>
-        </div>
-      </div>
-    </div>
-  </template>
-
-  <script src="app.js" type="module"></script>
+  <script src="app.js"></script>
 </body>
 </html>
