@@ -1,2558 +1,594 @@
-const DNS_ENDPOINT = "https://dns.google/resolve";
-const BRASIL_API = "https://brasilapi.com.br/api/cnpj/v1/";
-const JINA_PROXY = "https://r.jina.ai/";
+"use strict";
 
-const COMMON_PATHS = ["/", "/contato", "/sobre", "/empresa", "/quem-somos", "/institucional"];
-const BR_SECOND_LEVEL = new Set(["com.br", "co.br", "gov.br", "edu.br", "org.br", "net.br", "jus.br"]);
+/* ============================================================
+   Radar de CNPJ — descobre o CNPJ do dono de um domínio.
 
-// Wait for DOM to be ready
-document.addEventListener("DOMContentLoaded", () => {
-  // DOM Elements
-  const form = document.querySelector("#lookup-form");
-  const input = document.querySelector("#domain-input");
-  const csvUpload = document.querySelector("#csv-upload");
-  const uploadLabel = document.querySelector(".upload-label");
+   Ordem das fontes (da mais confiável para a menos):
+   1. RDAP do Registro.br: registro oficial do domínio .br,
+      traz o CNPJ do titular. Só funciona para domínios .br.
+   2. O próprio site (lido pelo r.jina.ai): procura CNPJs no texto
+      da home e de páginas comuns (contato, privacidade...).
+   3. BrasilAPI: confirma na Receita Federal se o CNPJ existe,
+      e traz razão social, situação e cidade.
+   ============================================================ */
 
-  const statusPanel = document.querySelector("#status-panel");
-  const statusText = document.querySelector("#status-text");
-  const statusHeading = statusPanel?.querySelector("h2");
-  const progressContainer = document.querySelector("#progress-container");
-  const progressFill = document.querySelector("#progress-fill");
-  const progressText = document.querySelector("#progress-text");
+const API = {
+  rdap: "https://rdap.registro.br/domain/",
+  dns: ["https://dns.google/resolve", "https://cloudflare-dns.com/dns-query"],
+  reader: "https://r.jina.ai/",
+  cnpj: "https://brasilapi.com.br/api/cnpj/v1/",
+};
 
-  const summaryList = document.querySelector("#summary-list");
-  const mxResults = document.querySelector("#mx-results");
-  const cnpjResults = document.querySelector("#cnpj-results");
-  const clueResults = document.querySelector("#clue-results");
+// Páginas onde sites brasileiros costumam publicar o CNPJ.
+// A home vem primeiro; as outras só são lidas se a home não tiver CNPJ.
+const SITE_PATHS = ["/", "/contato", "/politica-de-privacidade", "/sobre", "/quem-somos", "/termos-de-uso"];
 
-  const batchResultsSection = document.querySelector("#batch-results-section");
-  const batchResults = document.querySelector("#batch-results");
+// Categorias de segundo nível do .br (ex.: empresa.com.br, escritorio.adv.br).
+const BR_SLD = new Set(("adm adv agr am app arq art ato b bib bio blog bmd cim cng cnt com coop " +
+  "cri def des det dev ecn eco edu emp enf eng esp etc eti far flog fnd fot fst g12 geo ggf gov imb ind inf " +
+  "jor jus leg lel log mat med mil mp mus net nom not ntr odo ong org ppg pro psc psi qsl radio rec rep " +
+  "seg sjc slg srv taxi tc tec teo tmp trd tur tv vet vlog wiki zlg").split(" "));
 
-  // Templates
-  const mxTemplate = document.querySelector("#mx-item-template");
-  const cnpjTemplate = document.querySelector("#cnpj-item-template");
-  const clueTemplate = document.querySelector("#clue-item-template");
-  const batchTemplate = document.querySelector("#batch-item-template");
+const BATCH_CONCURRENCY = 3;
+const cache = new Map();
 
-  // Utilities
-  function normalizeDomain(value) {
-    const cleaned = value
-      .toLowerCase()
-      .replace(/^https?:\/\//, "")
-      .replace(/^www\./, "")
-      .replace(/\/.*$/, "")
-      .trim();
+/* ---------------- utilidades ---------------- */
 
-    if (!cleaned || !/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(cleaned)) return null;
+const onlyDigits = (v) => String(v ?? "").replace(/\D/g, "");
 
-    const parts = cleaned.split(".").filter(Boolean);
-    const suffix = parts.slice(-2).join(".");
-    const isSecondLevel = parts.length > 2 && BR_SECOND_LEVEL.has(suffix);
-    const rootDomain = isSecondLevel ? parts.slice(-3).join(".") : parts.length > 2 ? parts.slice(-2).join(".") : cleaned;
+function formatCnpj(v) {
+  const d = onlyDigits(v);
+  return d.length === 14 ? d.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, "$1.$2.$3/$4-$5") : String(v);
+}
 
-    return { displayDomain: cleaned, rootDomain };
+// Valida os dois dígitos verificadores (módulo 11).
+function isValidCnpj(v) {
+  const d = onlyDigits(v);
+  if (d.length !== 14 || /^(\d)\1{13}$/.test(d)) return false;
+  const digit = (len) => {
+    const weights = len === 12 ? [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2] : [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2];
+    const sum = weights.reduce((acc, w, i) => acc + Number(d[i]) * w, 0);
+    const r = sum % 11;
+    return r < 2 ? 0 : 11 - r;
+  };
+  return digit(12) === Number(d[12]) && digit(13) === Number(d[13]);
+}
+
+/** Aceita domínio, URL ou e-mail. Retorna { host, root } ou null. */
+function normalizeDomain(value) {
+  let s = String(value ?? "").trim().toLowerCase();
+  if (!s) return null;
+  if (s.includes("@") && !s.includes("/")) s = s.split("@").pop(); // e-mail
+  s = s.replace(/^[a-z]+:\/\//, "").split(/[/?#:\s]/)[0].replace(/^www\./, "").replace(/\.$/, "");
+  if (!/^(?=.{4,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$/.test(s)) return null;
+
+  const parts = s.split(".");
+  const tld = parts.at(-1);
+  let rootLen = 2;
+  if (tld === "br" && parts.length >= 3 && BR_SLD.has(parts.at(-2))) rootLen = 3;
+  else if (parts.length >= 3 && parts.at(-2).length <= 3 && tld.length === 2 && ["com", "co", "net", "org", "gov", "edu"].includes(parts.at(-2))) rootLen = 3; // ex.: empresa.co.uk
+  return { host: s, root: parts.slice(-rootLen).join(".") };
+}
+
+async function fetchWithTimeout(url, { timeout = 15000, ...opts } = {}) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeout);
+  try {
+    return await fetch(url, { ...opts, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
   }
+}
 
-  function validateCnpj(value) {
-    const digits = String(value).replace(/\D/g, "");
-    if (digits.length !== 14) return false;
-    if (/^(\d)\1{13}$/.test(digits)) return false;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-    let sum = 0, mult = 5;
-    for (let i = 0; i < 8; i++) {
-      sum += parseInt(digits[i]) * mult;
-      mult = mult === 2 ? 9 : mult - 1;
-    }
-    let remainder = sum % 11;
-    const d1 = remainder < 2 ? 0 : 11 - remainder;
+function cached(key, fn) {
+  if (!cache.has(key)) cache.set(key, fn().catch((e) => { cache.delete(key); throw e; }));
+  return cache.get(key);
+}
 
-    if (parseInt(digits[8]) !== d1) return false;
+/* ---------------- fontes ---------------- */
 
-    sum = 0;
-    mult = 6;
-    for (let i = 0; i < 9; i++) {
-      sum += parseInt(digits[i]) * mult;
-      mult = mult === 2 ? 9 : mult - 1;
-    }
-    remainder = sum % 11;
-    const d2 = remainder < 2 ? 0 : 11 - remainder;
+/** 1. Registro oficial do domínio (.br). */
+function lookupRdap(root) {
+  return cached("rdap:" + root, async () => {
+    if (!root.endsWith(".br")) return { status: "skip", note: "RDAP do Registro.br só cobre domínios .br" };
+    const res = await fetchWithTimeout(API.rdap + encodeURIComponent(root));
+    if (res.status === 404) return { status: "none", note: "Domínio não encontrado no Registro.br" };
+    if (res.status === 429) return { status: "error", note: "Registro.br limitou as consultas, tente em 1 minuto" };
+    if (!res.ok) return { status: "error", note: `Registro.br respondeu ${res.status}` };
 
-    return parseInt(digits[10]) === d2;
-  }
+    const data = await res.json();
+    const holder = (data.entities || []).find((e) => (e.roles || []).includes("registrant"));
+    const name = holder?.vcardArray?.[1]?.find((f) => f[0] === "fn")?.[3] || null;
+    const ids = holder?.publicIds || [];
+    const cnpj = ids.find((i) => i.type === "cnpj")?.identifier;
+    const created = (data.events || []).find((e) => e.eventAction === "registration")?.eventDate;
 
-  function formatCnpj(value) {
-    const digits = String(value).replace(/\D/g, "");
-    if (digits.length !== 14) return value;
-    return digits.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, "$1.$2.$3/$4-$5");
-  }
+    if (cnpj) return { status: "found", cnpj: onlyDigits(cnpj), name, created, note: `Titular: ${name || "?"}` };
+    if (ids.some((i) => i.type === "cpf")) return { status: "none", name, note: "Titular é pessoa física (CPF)" };
+    return { status: "none", name, note: "Registro sem CNPJ público" };
+  });
+}
 
-  function extractCnpjs(text) {
-    const cnpjs = new Set();
-    const patterns = [
-      /\b\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}\b/g,
-      /\b\d{2}[\s\-.]?\d{3}[\s\-.]?\d{3}[\s\/\-.]?\d{4}[\s\-.]?\d{2}\b/g,
-      /\b\d{14}\b/g,
-    ];
-
-    for (const pattern of patterns) {
-      const matches = text.match(pattern);
-      if (matches) {
-        matches.forEach(match => {
-          const digits = match.replace(/\D/g, "");
-          if (digits.length === 14 && validateCnpj(digits)) {
-            cnpjs.add(formatCnpj(digits));
-          }
+/** MX via DNS-over-HTTPS (com servidor reserva). */
+function lookupMx(root) {
+  return cached("mx:" + root, async () => {
+    for (const base of API.dns) {
+      try {
+        const res = await fetchWithTimeout(`${base}?name=${encodeURIComponent(root)}&type=MX`, {
+          headers: { accept: "application/dns-json" },
+          timeout: 8000,
         });
-      }
-    }
-    return Array.from(cnpjs);
-  }
-
-  function findOrganization(text) {
-    const jsonLd = text.match(/"name"\s*:\s*"([^"]{5,100})"/i);
-    if (jsonLd?.[1]) return jsonLd[1].trim();
-
-    const og = text.match(/property="og:title"\s+content="([^"]{5,100})"/i);
-    if (og?.[1]) return og[1].trim();
-
-    const copyright = text.match(/(?:©|copyright)\s+([^.\n|]{5,100})/i);
-    if (copyright?.[1]) return copyright[1].trim();
-
-    return null;
-  }
-
-  function classifyMxProvider(host) {
-    const normalized = host.toLowerCase();
-    
-    const providers = {
-      "Google Workspace": ["aspmx.l.google.com", "google.com"],
-      "Microsoft 365": ["outlook.com", "hotmail.com", "microsoft.com"],
-      "Zoho Mail": ["zoho.com"],
-      "Amazon SES": ["amazonses.com"],
-      "SendGrid": ["sendgrid.com"],
-      "Mailgun": ["mailgun.org", "mailgun.com"],
-    };
-    
-    for (const [provider, domains] of Object.entries(providers)) {
-      if (domains.some(d => normalized.includes(d))) return provider;
-    }
-    
-    const parts = normalized.split(".");
-    return parts.length >= 2 ? parts[parts.length - 2].toUpperCase() : "Outro";
-  }
-
-  // API Calls
-  async function lookupMx(domain) {
-    try {
-      const response = await fetch(`${DNS_ENDPOINT}?name=${encodeURIComponent(domain)}&type=MX`);
-      const data = await response.json();
-      const answers = data.Answer || [];
-      return answers
-        .map(record => {
-          const [priority, ...hostParts] = String(record.data).split(" ");
-          const host = hostParts.join(" ").replace(/\.$/, "");
-          return { host, priority, ttl: record.TTL, provider: classifyMxProvider(host) };
-        })
-        .filter(r => r.host);
-    } catch (e) {
-      console.error("MX lookup failed:", e);
-      return [];
-    }
-  }
-
-  async function fetchPage(domain, path = "/") {
-    try {
-      const response = await fetch(`${JINA_PROXY}http://${domain}${path}`, { signal: AbortSignal.timeout(8000) });
-      if (!response.ok) return null;
-      return await response.text();
-    } catch (e) {
-      console.error(`Error fetching ${domain}${path}:`, e.message);
-      return null;
-    }
-  }
-
-  async function enrichCnpj(cnpj) {
-    try {
-      const response = await fetch(`${BRASIL_API}${cnpj.replace(/\D/g, "")}`);
-      if (!response.ok) throw new Error("Not found");
-      const data = await response.json();
-      return {
-        company: data.nome_fantasia || data.razao_social,
-        status: data.descricao_situacao_cadastral,
-        city: data.municipio,
-        state: data.uf,
-      };
-    } catch (e) {
-      return { company: "Empresa não identificada", status: "", city: "", state: "" };
-    }
-  }
-
-  // Main Functions
-  async function inspectDomain(domain) {
-    const clues = [];
-    
-    for (const path of COMMON_PATHS) {
-      const html = await fetchPage(domain, path);
-      if (!html || html.length < 80) continue;
-
-      const cnpjs = extractCnpjs(html);
-      const organization = findOrganization(html);
-      const title = html.match(/<title>([^<]+)<\/title>/)?.[1] || organization || domain;
-      
-      clues.push({
-        path,
-        label: path === "/" ? "Principal" : path.replace(/\//g, "").toUpperCase(),
-        title,
-        organization,
-        cnpjs: cnpjs.map(cnpj => ({ raw: cnpj, formatted: cnpj })),
-        sourceUrl: `http://${domain}${path}`,
-        body: html.substring(0, 200),
-      });
-    }
-    
-    return clues;
-  }
-
-  async function analyzeDomain(domain) {
-    const normalized = normalizeDomain(domain);
-    if (!normalized) {
-      alert("Domínio inválido");
-      return;
-    }
-
-    setStatus("Pesquisando...", true);
-
-    try {
-      const [mxRecords, clues] = await Promise.all([
-        lookupMx(normalized.rootDomain),
-        inspectDomain(normalized.rootDomain),
-      ]);
-
-      const allCnpjs = clues.flatMap(c => c.cnpjs);
-      const uniqueCnpjs = [...new Map(allCnpjs.map(c => [c.formatted, c])).values()];
-      const enrichedCnpjs = await Promise.all(
-        uniqueCnpjs.map(async cnpj => ({
-          ...cnpj,
-          ...await enrichCnpj(cnpj.formatted),
-        }))
-      );
-
-      const organization = clues.find(c => c.organization)?.organization || null;
-      
-      renderResults(normalized, mxRecords, enrichedCnpjs, clues, organization);
-      setStatus("Pesquisa concluída com sucesso", false);
-
-    } catch (error) {
-      console.error(error);
-      setStatus("Erro na pesquisa", false);
-    }
-  }
-
-  // Render Functions
-  function setStatus(text, isLoading) {
-    if (!statusPanel) return;
-    
-    if (isLoading) {
-      statusPanel.style.display = "block";
-      if (statusHeading) statusHeading.textContent = text;
-      statusText.style.display = "none";
-      progressContainer.style.display = "block";
-      progressFill.style.width = "30%";
-      progressText.textContent = "Processando...";
-    } else {
-      progressFill.style.width = "100%";
-      progressText.textContent = text;
-      setTimeout(() => {
-        statusPanel.style.display = "block";
-        if (statusHeading) statusHeading.textContent = text;
-        statusText.style.display = "block";
-        progressContainer.style.display = "none";
-      }, 500);
-    }
-  }
-
-  function updateSummary(domain, organization, cnpjCount, mxCount) {
-    if (!summaryList) return;
-    const dds = summaryList.querySelectorAll("dd");
-    if (dds.length >= 4) {
-      dds[0].textContent = domain.displayDomain;
-      dds[1].textContent = domain.rootDomain;
-      dds[2].textContent = organization || "Não identificada";
-      dds[3].textContent = cnpjCount;
-    }
-  }
-
-  function renderResults(domain, mxRecords, cnpjs, clues, organization) {
-    if (!mxResults || !cnpjResults || !clueResults) return;
-
-    // Summary
-    updateSummary(domain, organization, cnpjs.length, mxRecords.length);
-
-    // MX
-    mxResults.innerHTML = "";
-    if (mxRecords.length === 0) {
-      mxResults.classList.add("empty-state");
-      mxResults.textContent = "Nenhum registro MX encontrado";
-    } else {
-      mxResults.classList.remove("empty-state");
-      mxRecords.forEach(record => {
-        if (!mxTemplate) return;
-        const fragment = mxTemplate.content.cloneNode(true);
-        const hostEl = fragment.querySelector("[data-host]");
-        const priorityEl = fragment.querySelector("[data-priority]");
-        const metaEl = fragment.querySelector("[data-meta]");
-        
-        if (hostEl) hostEl.textContent = record.host;
-        if (priorityEl) priorityEl.textContent = `Prioridade ${record.priority}`;
-        if (metaEl) metaEl.textContent = `TTL: ${record.ttl}s • ${record.provider}`;
-        
-        mxResults.appendChild(fragment);
-      });
-    }
-
-    // CNPJs
-    cnpjResults.innerHTML = "";
-    if (cnpjs.length === 0) {
-      cnpjResults.classList.add("empty-state");
-      cnpjResults.textContent = "Nenhum CNPJ encontrado";
-    } else {
-      cnpjResults.classList.remove("empty-state");
-      cnpjs.forEach(cnpj => {
-        if (!cnpjTemplate) return;
-        const fragment = cnpjTemplate.content.cloneNode(true);
-        
-        const cnpjEl = fragment.querySelector("[data-cnpj]");
-        const sourceEl = fragment.querySelector("[data-source]");
-        const companyEl = fragment.querySelector("[data-company]");
-        const extraEl = fragment.querySelector("[data-extra]");
-        
-        if (cnpjEl) cnpjEl.textContent = cnpj.formatted;
-        if (sourceEl) sourceEl.textContent = "Evidência pública";
-        if (companyEl) companyEl.textContent = cnpj.company;
-        
-        const meta = [];
-        if (cnpj.status) meta.push(cnpj.status);
-        if (cnpj.city) meta.push(`${cnpj.city}/${cnpj.state}`);
-        if (extraEl) extraEl.textContent = meta.join(" • ") || "Sem dados";
-        
-        cnpjResults.appendChild(fragment);
-      });
-    }
-
-    // Clues
-    clueResults.innerHTML = "";
-    if (clues.length === 0) {
-      clueResults.classList.add("empty-state");
-      clueResults.textContent = "Nenhuma pista encontrada";
-    } else {
-      clueResults.classList.remove("empty-state");
-      clues.forEach(clue => {
-        if (!clueTemplate) return;
-        const fragment = clueTemplate.content.cloneNode(true);
-        
-        const labelEl = fragment.querySelector("[data-label]");
-        const titleEl = fragment.querySelector("[data-title]");
-        const bodyEl = fragment.querySelector("[data-body]");
-        const linkEl = fragment.querySelector("[data-link]");
-        
-        if (labelEl) labelEl.textContent = clue.label;
-        if (titleEl) titleEl.textContent = clue.title;
-        if (bodyEl) bodyEl.textContent = clue.body.substring(0, 150) + "...";
-        if (linkEl) {
-          linkEl.href = clue.sourceUrl;
-          linkEl.textContent = "Abrir fonte";
-        }
-        
-        clueResults.appendChild(fragment);
-      });
-    }
-  }
-
-  // Batch Processing
-  async function processBatch(domains) {
-    if (!batchResultsSection || !batchResults) return;
-
-    batchResultsSection.style.display = "block";
-    batchResults.innerHTML = "";
-    setStatus(`Processando ${domains.length} domínios...`, true);
-
-    const results = [];
-
-    for (let i = 0; i < domains.length; i++) {
-      const domain = domains[i];
-      progressFill.style.width = `${(i / domains.length) * 100}%`;
-      progressText.textContent = `${i + 1}/${domains.length} - ${domain}`;
-
-      try {
-        const [mxRecords, clues] = await Promise.all([
-          lookupMx(domain),
-          inspectDomain(domain),
-        ]);
-
-        const cnpjsAll = clues.flatMap(c => c.cnpjs);
-        const uniqueCnpjs = [...new Map(cnpjsAll.map(c => [c.formatted, c])).values()];
-        const enrichedCnpjs = await Promise.all(
-          uniqueCnpjs.slice(0, 3).map(async cnpj => ({
-            ...cnpj,
-            ...await enrichCnpj(cnpj.formatted),
-          }))
-        );
-
-        const organization = clues.find(c => c.organization)?.organization || null;
-
-        results.push({
-          domain,
-          mxCount: mxRecords.length,
-          cnpjCount: enrichedCnpjs.length,
-          organization,
-          cnpjs: enrichedCnpjs,
-          status: enrichedCnpjs.length > 0 ? "success" : "warning",
-        });
-      } catch (error) {
-        results.push({
-          domain,
-          mxCount: 0,
-          cnpjCount: 0,
-          organization: null,
-          cnpjs: [],
-          status: "error",
-        });
-      }
-
-      await new Promise(r => setTimeout(r, 500));
-    }
-
-    renderBatchResults(results);
-    setStatus(`${domains.length} domínios processados`, false);
-  }
-
-  function renderBatchResults(results) {
-    if (!batchResults) return;
-
-    batchResults.innerHTML = "";
-    results.forEach(result => {
-      if (!batchTemplate) return;
-      const fragment = batchTemplate.content.cloneNode(true);
-      
-      const domainEl = fragment.querySelector("[data-domain]");
-      const statusEl = fragment.querySelector("[data-status]");
-      const mxEl = fragment.querySelector("[data-mx-count]");
-      const cnpjEl = fragment.querySelector("[data-cnpj-count]");
-      const orgEl = fragment.querySelector("[data-organization]");
-      const cnpjListEl = fragment.querySelector("[data-cnpj-list]");
-      const cnpjFormattedEl = fragment.querySelector("[data-cnpj-formatted]");
-      
-      if (domainEl) domainEl.textContent = result.domain;
-      if (mxEl) mxEl.textContent = result.mxCount;
-      if (cnpjEl) cnpjEl.textContent = result.cnpjCount;
-      if (orgEl) orgEl.textContent = result.organization || "-";
-      
-      if (statusEl) {
-        statusEl.textContent = result.status === "success" ? "✓ OK" : result.status === "warning" ? "⚠ Parcial" : "✗ Erro";
-        statusEl.className = `batch-status ${result.status}`;
-      }
-      
-      if (result.cnpjs.length > 0) {
-        if (cnpjListEl) cnpjListEl.style.display = "flex";
-        if (cnpjFormattedEl) cnpjFormattedEl.textContent = result.cnpjs.map(c => c.formatted).join(", ");
-      }
-      
-      batchResults.appendChild(fragment);
-    });
-  }
-
-  // CSV Parsing
-  async function parseCsvFile(file) {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        try {
-          const text = e.target.result;
-          const lines = text
-            .split("\n")
-            .map(l => l.trim())
-            .filter(l => l && l.includes("."));
-
-          const domains = lines.map(line => {
-            try {
-              const url = new URL(line.startsWith("http") ? line : `http://${line}`);
-              return url.hostname;
-            } catch {
-              return line;
-            }
-          }).filter(d => normalizeDomain(d));
-
-          resolve([...new Set(domains)]);
-        } catch (error) {
-          reject(new Error("Erro ao ler arquivo: " + error.message));
-        }
-      };
-      reader.onerror = () => reject(new Error("Erro ao ler arquivo"));
-      reader.readAsText(file);
-    });
-  }
-
-  // Event Listeners
-  if (form) {
-    form.addEventListener("submit", (e) => {
-      e.preventDefault();
-      if (input.value.trim()) {
-        analyzeDomain(input.value.trim());
-        input.value = "";
-      }
-    });
-  }
-
-  if (uploadLabel) {
-    uploadLabel.addEventListener("click", (e) => {
-      if (csvUpload && e.target === uploadLabel) {
-        csvUpload.click();
-      }
-    });
-  }
-
-  if (csvUpload) {
-    csvUpload.addEventListener("change", async (e) => {
-      const file = e.target.files[0];
-      if (!file) return;
-
-      try {
-        const domains = await parseCsvFile(file);
-        if (domains.length === 0) {
-          alert("Nenhum domínio válido encontrado");
-          return;
-        }
-        await processBatch(domains);
-      } catch (error) {
-        alert("Erro: " + error.message);
-      }
-    });
-  }
-
-  console.log("✓ App inicializado com sucesso");
-});
-const DNS_ENDPOINT = "https://dns.google/resolve";
-const BRASIL_API = "https://brasilapi.com.br/api/cnpj/v1/";
-const JINA_PROXY = "https://r.jina.ai/";
-
-const COMMON_PATHS = ["/", "/contato", "/sobre", "/empresa", "/quem-somos", "/institucional"];
-const BR_SECOND_LEVEL = new Set(["com.br", "co.br", "gov.br", "edu.br", "org.br", "net.br", "jus.br"]);
-
-// DOM Elements
-const form = document.querySelector("#lookup-form");
-const input = document.querySelector("#domain-input");
-const csvUpload = document.querySelector("#csv-upload");
-const uploadLabel = document.querySelector(".upload-label");
-
-const statusPanel = document.querySelector("#status-panel");
-const statusText = document.querySelector("#status-text");
-const statusHeading = statusPanel?.querySelector("h2");
-const progressContainer = document.querySelector("#progress-container");
-const progressFill = document.querySelector("#progress-fill");
-const progressText = document.querySelector("#progress-text");
-
-const summaryList = document.querySelector("#summary-list");
-const mxResults = document.querySelector("#mx-results");
-const cnpjResults = document.querySelector("#cnpj-results");
-const clueResults = document.querySelector("#clue-results");
-
-const batchResultsSection = document.querySelector("#batch-results-section");
-const batchResults = document.querySelector("#batch-results");
-
-// Templates
-const mxTemplate = document.querySelector("#mx-item-template");
-const cnpjTemplate = document.querySelector("#cnpj-item-template");
-const clueTemplate = document.querySelector("#clue-item-template");
-const batchTemplate = document.querySelector("#batch-item-template");
-
-// Utilities
-function normalizeDomain(value) {
-  const cleaned = value
-    .toLowerCase()
-    .replace(/^https?:\/\//, "")
-    .replace(/^www\./, "")
-    .replace(/\/.*$/, "")
-    .trim();
-
-  if (!cleaned || !/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(cleaned)) return null;
-
-  const parts = cleaned.split(".").filter(Boolean);
-  const suffix = parts.slice(-2).join(".");
-  const isSecondLevel = parts.length > 2 && BR_SECOND_LEVEL.has(suffix);
-  const rootDomain = isSecondLevel ? parts.slice(-3).join(".") : parts.length > 2 ? parts.slice(-2).join(".") : cleaned;
-
-  return { displayDomain: cleaned, rootDomain };
-}
-
-function validateCnpj(value) {
-  const digits = String(value).replace(/\D/g, "");
-  if (digits.length !== 14) return false;
-  if (/^(\d)\1{13}$/.test(digits)) return false;
-
-  let sum = 0, mult = 5;
-  for (let i = 0; i < 8; i++) {
-    sum += parseInt(digits[i]) * mult;
-    mult = mult === 2 ? 9 : mult - 1;
-  }
-  let remainder = sum % 11;
-  const d1 = remainder < 2 ? 0 : 11 - remainder;
-
-  if (parseInt(digits[8]) !== d1) return false;
-
-  sum = 0;
-  mult = 6;
-  for (let i = 0; i < 9; i++) {
-    sum += parseInt(digits[i]) * mult;
-    mult = mult === 2 ? 9 : mult - 1;
-  }
-  remainder = sum % 11;
-  const d2 = remainder < 2 ? 0 : 11 - remainder;
-
-  return parseInt(digits[10]) === d2;
-}
-
-function formatCnpj(value) {
-  const digits = String(value).replace(/\D/g, "");
-  if (digits.length !== 14) return value;
-  return digits.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, "$1.$2.$3/$4-$5");
-}
-
-function extractCnpjs(text) {
-  const cnpjs = new Set();
-  const patterns = [
-    /\b\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}\b/g,
-    /\b\d{2}[\s\-.]?\d{3}[\s\-.]?\d{3}[\s\/\-.]?\d{4}[\s\-.]?\d{2}\b/g,
-    /\b\d{14}\b/g,
-  ];
-
-  for (const pattern of patterns) {
-    const matches = text.match(pattern);
-    if (matches) {
-      matches.forEach(match => {
-        const digits = match.replace(/\D/g, "");
-        if (digits.length === 14 && validateCnpj(digits)) {
-          cnpjs.add(formatCnpj(digits));
-        }
-      });
-    }
-  }
-  return Array.from(cnpjs);
-}
-
-function findOrganization(text) {
-  const jsonLd = text.match(/"name"\s*:\s*"([^"]{5,100})"/i);
-  if (jsonLd?.[1]) return jsonLd[1].trim();
-
-  const og = text.match(/property="og:title"\s+content="([^"]{5,100})"/i);
-  if (og?.[1]) return og[1].trim();
-
-  const copyright = text.match(/(?:©|copyright)\s+([^.\n|]{5,100})/i);
-  if (copyright?.[1]) return copyright[1].trim();
-
-  return null;
-}
-
-function classifyMxProvider(host) {
-  const normalized = host.toLowerCase();
-  
-  const providers = {
-    "Google Workspace": ["aspmx.l.google.com", "google.com"],
-    "Microsoft 365": ["outlook.com", "hotmail.com", "microsoft.com"],
-    "Zoho Mail": ["zoho.com"],
-    "Amazon SES": ["amazonses.com"],
-    "SendGrid": ["sendgrid.com"],
-    "Mailgun": ["mailgun.org", "mailgun.com"],
-  };
-  
-  for (const [provider, domains] of Object.entries(providers)) {
-    if (domains.some(d => normalized.includes(d))) return provider;
-  }
-  
-  const parts = normalized.split(".");
-  return parts.length >= 2 ? parts[parts.length - 2].toUpperCase() : "Outro";
-}
-
-// API Calls
-async function lookupMx(domain) {
-  try {
-    const response = await fetch(`${DNS_ENDPOINT}?name=${encodeURIComponent(domain)}&type=MX`);
-    const data = await response.json();
-    const answers = data.Answer || [];
-    return answers
-      .map(record => {
-        const [priority, ...hostParts] = String(record.data).split(" ");
-        const host = hostParts.join(" ").replace(/\.$/, "");
-        return { host, priority, ttl: record.TTL, provider: classifyMxProvider(host) };
-      })
-      .filter(r => r.host);
-  } catch (e) {
-    console.error("MX lookup failed:", e);
-    return [];
-  }
-}
-
-async function fetchPage(domain, path = "/") {
-  try {
-    const response = await fetch(`${JINA_PROXY}http://${domain}${path}`, { signal: AbortSignal.timeout(8000) });
-    if (!response.ok) return null;
-    return await response.text();
-  } catch (e) {
-    console.error(`Error fetching ${domain}${path}:`, e.message);
-    return null;
-  }
-}
-
-async function enrichCnpj(cnpj) {
-  try {
-    const response = await fetch(`${BRASIL_API}${cnpj.replace(/\D/g, "")}`);
-    if (!response.ok) throw new Error("Not found");
-    const data = await response.json();
-    return {
-      company: data.nome_fantasia || data.razao_social,
-      status: data.descricao_situacao_cadastral,
-      city: data.municipio,
-      state: data.uf,
-    };
-  } catch (e) {
-    return { company: "Empresa não identificada", status: "", city: "", state: "" };
-  }
-}
-
-// Main Functions
-async function inspectDomain(domain) {
-  const clues = [];
-  
-  for (const path of COMMON_PATHS) {
-    const html = await fetchPage(domain, path);
-    if (!html || html.length < 80) continue;
-
-    const cnpjs = extractCnpjs(html);
-    const organization = findOrganization(html);
-    const title = html.match(/<title>([^<]+)<\/title>/)?.[1] || organization || domain;
-    
-    clues.push({
-      path,
-      label: path === "/" ? "Principal" : path.replace(/\//g, "").toUpperCase(),
-      title,
-      organization,
-      cnpjs: cnpjs.map(cnpj => ({ raw: cnpj, formatted: cnpj })),
-      sourceUrl: `http://${domain}${path}`,
-      body: html.substring(0, 200),
-    });
-  }
-  
-  return clues;
-}
-
-async function analyzeDomain(domain) {
-  const normalized = normalizeDomain(domain);
-  if (!normalized) {
-    alert("Domínio inválido");
-    return;
-  }
-
-  setStatus("Pesquisando...", true);
-
-  try {
-    const [mxRecords, clues] = await Promise.all([
-      lookupMx(normalized.rootDomain),
-      inspectDomain(normalized.rootDomain),
-    ]);
-
-    const allCnpjs = clues.flatMap(c => c.cnpjs);
-    const uniqueCnpjs = [...new Map(allCnpjs.map(c => [c.formatted, c])).values()];
-    const enrichedCnpjs = await Promise.all(
-      uniqueCnpjs.map(async cnpj => ({
-        ...cnpj,
-        ...await enrichCnpj(cnpj.formatted),
-      }))
-    );
-
-    const organization = clues.find(c => c.organization)?.organization || null;
-    
-    renderResults(normalized, mxRecords, enrichedCnpjs, clues, organization);
-    setStatus("Pesquisa concluída com sucesso", false);
-
-  } catch (error) {
-    console.error(error);
-    setStatus("Erro na pesquisa", false);
-  }
-}
-
-// Render Functions
-function setStatus(text, isLoading) {
-  if (isLoading) {
-    statusPanel.style.display = "block";
-    statusHeading.textContent = text;
-    statusText.style.display = "none";
-    progressContainer.style.display = "block";
-    progressFill.style.width = "30%";
-    progressText.textContent = "Processando...";
-  } else {
-    progressFill.style.width = "100%";
-    progressText.textContent = text;
-    setTimeout(() => {
-      statusPanel.style.display = "block";
-      statusHeading.textContent = text;
-      statusText.style.display = "block";
-      progressContainer.style.display = "none";
-    }, 500);
-  }
-}
-
-function updateSummary(domain, organization, cnpjCount, mxCount) {
-  const dds = summaryList.querySelectorAll("dd");
-  dds[0].textContent = domain.displayDomain;
-  dds[1].textContent = domain.rootDomain;
-  dds[2].textContent = organization || "Não identificada";
-  dds[3].textContent = cnpjCount;
-}
-
-function renderResults(domain, mxRecords, cnpjs, clues, organization) {
-  // Summary
-  updateSummary(domain, organization, cnpjs.length, mxRecords.length);
-
-  // MX
-  mxResults.innerHTML = "";
-  if (mxRecords.length === 0) {
-    mxResults.classList.add("empty-state");
-    mxResults.textContent = "Nenhum registro MX encontrado";
-  } else {
-    mxResults.classList.remove("empty-state");
-    mxRecords.forEach(record => {
-      const fragment = mxTemplate.content.cloneNode(true);
-      fragment.querySelector("[data-host]").textContent = record.host;
-      fragment.querySelector("[data-priority]").textContent = `Prioridade ${record.priority}`;
-      fragment.querySelector("[data-meta]").textContent = `TTL: ${record.ttl}s • ${record.provider}`;
-      mxResults.appendChild(fragment);
-    });
-  }
-
-  // CNPJs
-  cnpjResults.innerHTML = "";
-  if (cnpjs.length === 0) {
-    cnpjResults.classList.add("empty-state");
-    cnpjResults.textContent = "Nenhum CNPJ encontrado";
-  } else {
-    cnpjResults.classList.remove("empty-state");
-    cnpjs.forEach(cnpj => {
-      const fragment = cnpjTemplate.content.cloneNode(true);
-      fragment.querySelector("[data-cnpj]").textContent = cnpj.formatted;
-      fragment.querySelector("[data-source]").textContent = "Evidência pública";
-      fragment.querySelector("[data-company]").textContent = cnpj.company;
-      
-      const meta = [];
-      if (cnpj.status) meta.push(cnpj.status);
-      if (cnpj.city) meta.push(`${cnpj.city}/${cnpj.state}`);
-      fragment.querySelector("[data-extra]").textContent = meta.join(" • ") || "Sem dados";
-      
-      cnpjResults.appendChild(fragment);
-    });
-  }
-
-  // Clues
-  clueResults.innerHTML = "";
-  if (clues.length === 0) {
-    clueResults.classList.add("empty-state");
-    clueResults.textContent = "Nenhuma pista encontrada";
-  } else {
-    clueResults.classList.remove("empty-state");
-    clues.forEach(clue => {
-      const fragment = clueTemplate.content.cloneNode(true);
-      fragment.querySelector("[data-label]").textContent = clue.label;
-      fragment.querySelector("[data-title]").textContent = clue.title;
-      fragment.querySelector("[data-body]").textContent = clue.body.substring(0, 150) + "...";
-      const link = fragment.querySelector("[data-link]");
-      link.href = clue.sourceUrl;
-      clueResults.appendChild(fragment);
-    });
-  }
-}
-
-// Batch Processing
-async function processBatch(domains) {
-  batchResultsSection.style.display = "block";
-  batchResults.innerHTML = "";
-  setStatus(`Processando ${domains.length} domínios...`, true);
-
-  const results = [];
-
-  for (let i = 0; i < domains.length; i++) {
-    const domain = domains[i];
-    progressFill.style.width = `${(i / domains.length) * 100}%`;
-    progressText.textContent = `${i + 1}/${domains.length} - ${domain}`;
-
-    try {
-      const [mxRecords, clues] = await Promise.all([
-        lookupMx(domain),
-        inspectDomain(domain),
-      ]);
-
-      const cnpjs = clues.flatMap(c => c.cnpjs);
-      const uniqueCnpjs = [...new Map(cnpjs.map(c => [c.formatted, c])).values()];
-      const enrichedCnpjs = await Promise.all(
-        uniqueCnpjs.slice(0, 3).map(async cnpj => ({
-          ...cnpj,
-          ...await enrichCnpj(cnpj.formatted),
-        }))
-      );
-
-      const organization = clues.find(c => c.organization)?.organization || null;
-
-      results.push({
-        domain,
-        mxCount: mxRecords.length,
-        cnpjCount: enrichedCnpjs.length,
-        organization,
-        cnpjs: enrichedCnpjs,
-        status: enrichedCnpjs.length > 0 ? "success" : "warning",
-      });
-    } catch (error) {
-      results.push({
-        domain,
-        mxCount: 0,
-        cnpjCount: 0,
-        organization: null,
-        cnpjs: [],
-        status: "error",
-      });
-    }
-
-    await new Promise(r => setTimeout(r, 500));
-  }
-
-  renderBatchResults(results);
-  setStatus(`${domains.length} domínios processados`, false);
-}
-
-function renderBatchResults(results) {
-  batchResults.innerHTML = "";
-  results.forEach(result => {
-    const fragment = batchTemplate.content.cloneNode(true);
-    fragment.querySelector("[data-domain]").textContent = result.domain;
-    fragment.querySelector("[data-mx-count]").textContent = result.mxCount;
-    fragment.querySelector("[data-cnpj-count]").textContent = result.cnpjCount;
-    fragment.querySelector("[data-organization]").textContent = result.organization || "-";
-    
-    const badge = fragment.querySelector("[data-status]");
-    badge.textContent = result.status === "success" ? "✓ OK" : result.status === "warning" ? "⚠ Parcial" : "✗ Erro";
-    badge.className = `batch-status ${result.status}`;
-    
-    if (result.cnpjs.length > 0) {
-      const cnpjList = fragment.querySelector("[data-cnpj-list]");
-      cnpjList.style.display = "flex";
-      fragment.querySelector("[data-cnpj-formatted]").textContent = result.cnpjs
-        .map(c => c.formatted)
-        .join(", ");
-    }
-    
-    batchResults.appendChild(fragment);
-  });
-}
-
-// CSV Parsing
-async function parseCsvFile(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      try {
-        const text = e.target.result;
-        const lines = text
-          .split("\n")
-          .map(l => l.trim())
-          .filter(l => l && l.includes("."));
-
-        const domains = lines.map(line => {
-          try {
-            const url = new URL(line.startsWith("http") ? line : `http://${line}`);
-            return url.hostname;
-          } catch {
-            return line;
-          }
-        }).filter(d => normalizeDomain(d));
-
-        resolve([...new Set(domains)]);
-      } catch (error) {
-        reject(new Error("Erro ao ler arquivo: " + error.message));
-      }
-    };
-    reader.onerror = () => reject(new Error("Erro ao ler arquivo"));
-    reader.readAsText(file);
-  });
-}
-
-// Event Listeners
-form.addEventListener("submit", (e) => {
-  e.preventDefault();
-  analyzeDomain(input.value);
-  input.value = "";
-});
-
-csvUpload.addEventListener("change", async (e) => {
-  const file = e.target.files[0];
-  if (!file) return;
-
-  try {
-    const domains = await parseCsvFile(file);
-    if (domains.length === 0) {
-      alert("Nenhum domínio válido encontrado");
-      return;
-    }
-    await processBatch(domains);
-  } catch (error) {
-    alert("Erro: " + error.message);
-  }
-});
-const DNS_ENDPOINT = "https://dns.google/resolve";
-const BRASIL_API = "https://brasilapi.com.br/api/cnpj/v1/";
-const JINA_PROXY = "https://r.jina.ai/";
-
-const COMMON_PATHS = ["/", "/contato", "/sobre", "/empresa", "/quem-somos", "/institucional"];
-const BR_SECOND_LEVEL = new Set(["com.br", "co.br", "gov.br", "edu.br", "org.br", "net.br", "jus.br"]);
-
-// DOM Elements
-const form = document.querySelector("#lookup-form");
-const input = document.querySelector("#domain-input");
-const csvUpload = document.querySelector("#csv-upload");
-
-const statusPanel = document.querySelector("#status-panel");
-const statusText = document.querySelector("#status-text");
-const progressFill = document.querySelector("#progress-fill");
-const progressText = document.querySelector("#progress-text");
-
-const summaryPanel = document.querySelector("#summary-panel");
-const summaryDomain = document.querySelector("#summary-domain");
-const summaryOrg = document.querySelector("#summary-org");
-const summaryCnpjCount = document.querySelector("#summary-cnpj-count");
-const summaryMxCount = document.querySelector("#summary-mx-count");
-
-const mxPanel = document.querySelector("#mx-panel");
-const mxResults = document.querySelector("#mx-results");
-const cnpjPanel = document.querySelector("#cnpj-panel");
-const cnpjResults = document.querySelector("#cnpj-results");
-const cluePanel = document.querySelector("#clue-panel");
-const clueResults = document.querySelector("#clue-results");
-
-const batchResultsSection = document.querySelector("#batch-results-section");
-const batchResults = document.querySelector("#batch-results");
-
-// Templates
-const mxTemplate = document.querySelector("#mx-item-template");
-const cnpjTemplate = document.querySelector("#cnpj-item-template");
-const clueTemplate = document.querySelector("#clue-item-template");
-const batchTemplate = document.querySelector("#batch-item-template");
-
-// Utilities
-function normalizeDomain(value) {
-  const cleaned = value
-    .toLowerCase()
-    .replace(/^https?:\/\//, "")
-    .replace(/^www\./, "")
-    .replace(/\/.*$/, "")
-    .trim();
-
-  if (!cleaned || !/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(cleaned)) return null;
-
-  const parts = cleaned.split(".").filter(Boolean);
-  const suffix = parts.slice(-2).join(".");
-  const isSecondLevel = parts.length > 2 && BR_SECOND_LEVEL.has(suffix);
-  const rootDomain = isSecondLevel ? parts.slice(-3).join(".") : parts.length > 2 ? parts.slice(-2).join(".") : cleaned;
-
-  return { displayDomain: cleaned, rootDomain };
-}
-
-function validateCnpj(value) {
-  const digits = String(value).replace(/\D/g, "");
-  if (digits.length !== 14) return false;
-  if (/^(\d)\1{13}$/.test(digits)) return false;
-
-  let sum = 0, mult = 5;
-  for (let i = 0; i < 8; i++) {
-    sum += parseInt(digits[i]) * mult;
-    mult = mult === 2 ? 9 : mult - 1;
-  }
-  let remainder = sum % 11;
-  const d1 = remainder < 2 ? 0 : 11 - remainder;
-
-  if (parseInt(digits[8]) !== d1) return false;
-
-  sum = 0;
-  mult = 6;
-  for (let i = 0; i < 9; i++) {
-    sum += parseInt(digits[i]) * mult;
-    mult = mult === 2 ? 9 : mult - 1;
-  }
-  remainder = sum % 11;
-  const d2 = remainder < 2 ? 0 : 11 - remainder;
-
-  return parseInt(digits[10]) === d2;
-}
-
-function formatCnpj(value) {
-  const digits = String(value).replace(/\D/g, "");
-  if (digits.length !== 14) return value;
-  return digits.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, "$1.$2.$3/$4-$5");
-}
-
-function extractCnpjs(text) {
-  const cnpjs = new Set();
-  const patterns = [
-    /\b\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}\b/g,
-    /\b\d{2}[\s\-.]?\d{3}[\s\-.]?\d{3}[\s\/\-.]?\d{4}[\s\-.]?\d{2}\b/g,
-    /\b\d{14}\b/g,
-  ];
-
-  for (const pattern of patterns) {
-    const matches = text.match(pattern);
-    if (matches) {
-      matches.forEach(match => {
-        const digits = match.replace(/\D/g, "");
-        if (digits.length === 14 && validateCnpj(digits)) {
-          cnpjs.add(formatCnpj(digits));
-        }
-      });
-    }
-  }
-  return Array.from(cnpjs);
-}
-
-function findOrganization(text) {
-  const jsonLd = text.match(/"name"\s*:\s*"([^"]{5,100})"/i);
-  if (jsonLd?.[1]) return jsonLd[1].trim();
-
-  const og = text.match(/property="og:title"\s+content="([^"]{5,100})"/i);
-  if (og?.[1]) return og[1].trim();
-
-  const copyright = text.match(/(?:©|copyright)\s+([^.\n|]{5,100})/i);
-  if (copyright?.[1]) return copyright[1].trim();
-
-  return null;
-}
-
-function classifyMxProvider(host) {
-  const normalized = host.toLowerCase();
-  
-  const providers = {
-    "Google Workspace": ["aspmx.l.google.com", "google.com"],
-    "Microsoft 365": ["outlook.com", "hotmail.com", "microsoft.com"],
-    "Zoho Mail": ["zoho.com"],
-    "Amazon SES": ["amazonses.com"],
-    "SendGrid": ["sendgrid.com"],
-    "Mailgun": ["mailgun.org", "mailgun.com"],
-  };
-  
-  for (const [provider, domains] of Object.entries(providers)) {
-    if (domains.some(d => normalized.includes(d))) return provider;
-  }
-  
-  const parts = normalized.split(".");
-  return parts.length >= 2 ? parts[parts.length - 2].toUpperCase() : "Outro";
-}
-
-// API Calls
-async function lookupMx(domain) {
-  try {
-    const response = await fetch(`${DNS_ENDPOINT}?name=${encodeURIComponent(domain)}&type=MX`);
-    const data = await response.json();
-    const answers = data.Answer || [];
-    return answers
-      .map(record => {
-        const [priority, ...hostParts] = String(record.data).split(" ");
-        const host = hostParts.join(" ").replace(/\.$/, "");
-        return { host, priority, ttl: record.TTL, provider: classifyMxProvider(host) };
-      })
-      .filter(r => r.host);
-  } catch (e) {
-    console.error("MX lookup failed:", e);
-    return [];
-  }
-}
-
-async function fetchPage(domain, path = "/") {
-  try {
-    const response = await fetch(`${JINA_PROXY}http://${domain}${path}`, { signal: AbortSignal.timeout(8000) });
-    if (!response.ok) return null;
-    return await response.text();
-  } catch (e) {
-    console.error(`Error fetching ${domain}${path}:`, e.message);
-    return null;
-  }
-}
-
-async function enrichCnpj(cnpj) {
-  try {
-    const response = await fetch(`${BRASIL_API}${cnpj.replace(/\D/g, "")}`);
-    if (!response.ok) throw new Error("Not found");
-    const data = await response.json();
-    return {
-      company: data.nome_fantasia || data.razao_social,
-      status: data.descricao_situacao_cadastral,
-      city: data.municipio,
-      state: data.uf,
-    };
-  } catch (e) {
-    return { company: "Empresa não identificada", status: "", city: "", state: "" };
-  }
-}
-
-// Main Functions
-async function inspectDomain(domain) {
-  const clues = [];
-  
-  for (const path of COMMON_PATHS) {
-    const html = await fetchPage(domain, path);
-    if (!html || html.length < 80) continue;
-
-    const cnpjs = extractCnpjs(html);
-    const organization = findOrganization(html);
-    const title = html.match(/<title>([^<]+)<\/title>/)?.[1] || organization || domain;
-    
-    clues.push({
-      path,
-      label: path === "/" ? "Principal" : path.replace(/\//g, "").toUpperCase(),
-      title,
-      organization,
-      cnpjs: cnpjs.map(cnpj => ({ raw: cnpj, formatted: cnpj })),
-      sourceUrl: `http://${domain}${path}`,
-      body: html.substring(0, 200),
-    });
-  }
-  
-  return clues;
-}
-
-async function analyzeDomain(domain) {
-  const normalized = normalizeDomain(domain);
-  if (!normalized) {
-    alert("Domínio inválido");
-    return;
-  }
-
-  setStatus("Pesquisando...", true);
-
-  try {
-    const [mxRecords, clues] = await Promise.all([
-      lookupMx(normalized.rootDomain),
-      inspectDomain(normalized.rootDomain),
-    ]);
-
-    const allCnpjs = clues.flatMap(c => c.cnpjs);
-    const uniqueCnpjs = [...new Map(allCnpjs.map(c => [c.formatted, c])).values()];
-    const enrichedCnpjs = await Promise.all(
-      uniqueCnpjs.map(async cnpj => ({
-        ...cnpj,
-        ...await enrichCnpj(cnpj.formatted),
-      }))
-    );
-
-    const organization = clues.find(c => c.organization)?.organization || null;
-    
-    renderResults(normalized, mxRecords, enrichedCnpjs, clues, organization);
-    setStatus("Pesquisa concluída", false);
-
-  } catch (error) {
-    console.error(error);
-    setStatus("Erro na pesquisa", false);
-  }
-}
-
-// Render Functions
-function setStatus(text, isLoading) {
-  statusPanel.style.display = "block";
-  statusText.textContent = text;
-  
-  if (isLoading) {
-    progressFill.style.width = "30%";
-    progressText.textContent = "Processando...";
-  } else {
-    progressFill.style.width = "100%";
-    progressText.textContent = "Concluído";
-    setTimeout(() => statusPanel.style.display = "none", 3000);
-  }
-}
-
-function renderResults(domain, mxRecords, cnpjs, clues, organization) {
-  // Summary
-  summaryPanel.style.display = "block";
-  summaryDomain.textContent = domain.displayDomain;
-  summaryOrg.textContent = organization || "Não identificada";
-  summaryCnpjCount.textContent = cnpjs.length;
-  summaryMxCount.textContent = mxRecords.length;
-
-  // MX
-  mxPanel.style.display = "block";
-  mxResults.innerHTML = "";
-  if (mxRecords.length === 0) {
-    mxResults.innerHTML = '<div class="empty-state">Nenhum registro MX encontrado</div>';
-  } else {
-    mxRecords.forEach(record => {
-      const fragment = mxTemplate.content.cloneNode(true);
-      fragment.querySelector("[data-provider]").textContent = record.provider;
-      fragment.querySelector("[data-provider-type]").textContent = `Prioridade ${record.priority}`;
-      fragment.querySelector("[data-host]").textContent = record.host;
-      mxResults.appendChild(fragment);
-    });
-  }
-
-  // CNPJs
-  cnpjPanel.style.display = "block";
-  cnpjResults.innerHTML = "";
-  if (cnpjs.length === 0) {
-    cnpjResults.innerHTML = '<div class="empty-state">Nenhum CNPJ encontrado</div>';
-  } else {
-    cnpjs.forEach(cnpj => {
-      const fragment = cnpjTemplate.content.cloneNode(true);
-      fragment.querySelector("[data-cnpj]").textContent = cnpj.formatted;
-      fragment.querySelector("[data-company]").textContent = cnpj.company;
-      
-      const meta = [];
-      if (cnpj.status) meta.push(cnpj.status);
-      if (cnpj.city) meta.push(`${cnpj.city}/${cnpj.state}`);
-      fragment.querySelector("[data-meta]").textContent = meta.join(" • ") || "Sem dados";
-      
-      cnpjResults.appendChild(fragment);
-    });
-  }
-
-  // Clues
-  cluePanel.style.display = "block";
-  clueResults.innerHTML = "";
-  if (clues.length === 0) {
-    clueResults.innerHTML = '<div class="empty-state">Nenhuma pista encontrada</div>';
-  } else {
-    clues.forEach(clue => {
-      const fragment = clueTemplate.content.cloneNode(true);
-      fragment.querySelector("[data-label]").textContent = clue.label;
-      fragment.querySelector("[data-title]").textContent = clue.title;
-      fragment.querySelector("[data-body]").textContent = clue.body.substring(0, 120) + "...";
-      const link = fragment.querySelector("[data-link]");
-      link.href = clue.sourceUrl;
-      clueResults.appendChild(fragment);
-    });
-  }
-}
-
-// Batch Processing
-async function processBatch(domains) {
-  batchResultsSection.style.display = "block";
-  batchResults.innerHTML = "";
-  setStatus(`Processando ${domains.length} domínios...`, true);
-
-  const results = [];
-
-  for (let i = 0; i < domains.length; i++) {
-    const domain = domains[i];
-    progressFill.style.width = `${(i / domains.length) * 100}%`;
-    progressText.textContent = `${i + 1}/${domains.length} - ${domain}`;
-
-    try {
-      const [mxRecords, clues] = await Promise.all([
-        lookupMx(domain),
-        inspectDomain(domain),
-      ]);
-
-      const cnpjs = clues.flatMap(c => c.cnpjs);
-      const uniqueCnpjs = [...new Map(cnpjs.map(c => [c.formatted, c])).values()];
-      const enrichedCnpjs = await Promise.all(
-        uniqueCnpjs.slice(0, 1).map(async cnpj => ({
-          ...cnpj,
-          ...await enrichCnpj(cnpj.formatted),
-        }))
-      );
-
-      const providers = [...new Set(mxRecords.map(r => r.provider))].join(", ");
-
-      results.push({
-        domain,
-        cnpj: enrichedCnpjs[0]?.formatted || "-",
-        company: enrichedCnpjs[0]?.company || "-",
-        email: providers || "-",
-        status: enrichedCnpjs.length > 0 ? "success" : "warning",
-      });
-    } catch (error) {
-      results.push({
-        domain,
-        cnpj: "-",
-        company: "Erro",
-        email: "-",
-        status: "error",
-      });
-    }
-
-    await new Promise(r => setTimeout(r, 500));
-  }
-
-  renderBatchResults(results);
-  setStatus(`${domains.length} domínios processados`, false);
-}
-
-function renderBatchResults(results) {
-  batchResults.innerHTML = "";
-  results.forEach(result => {
-    const fragment = batchTemplate.content.cloneNode(true);
-    fragment.querySelector("[data-domain]").textContent = result.domain;
-    fragment.querySelector("[data-cnpj]").textContent = result.cnpj;
-    fragment.querySelector("[data-company]").textContent = result.company;
-    fragment.querySelector("[data-email]").textContent = result.email;
-    
-    const badge = fragment.querySelector("[data-status]");
-    badge.textContent = result.status === "success" ? "✓ OK" : result.status === "warning" ? "⚠ Parcial" : "✗ Erro";
-    badge.className = `batch-status ${result.status}`;
-    
-    batchResults.appendChild(fragment);
-  });
-}
-
-// CSV Parsing
-async function parseCsvFile(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      try {
-        const text = e.target.result;
-        const lines = text
-          .split("\n")
-          .map(l => l.trim())
-          .filter(l => l && l.includes("."));
-
-        const domains = lines.map(line => {
-          try {
-            const url = new URL(line.startsWith("http") ? line : `http://${line}`);
-            return url.hostname;
-          } catch {
-            return line;
-          }
-        }).filter(d => normalizeDomain(d));
-
-        resolve([...new Set(domains)]);
-      } catch (error) {
-        reject(new Error("Erro ao ler arquivo: " + error.message));
-      }
-    };
-    reader.onerror = () => reject(new Error("Erro ao ler arquivo"));
-    reader.readAsText(file);
-  });
-}
-
-// Event Listeners
-form.addEventListener("submit", (e) => {
-  e.preventDefault();
-  analyzeDomain(input.value);
-  input.value = "";
-});
-
-csvUpload.addEventListener("change", async (e) => {
-  const file = e.target.files[0];
-  if (!file) return;
-
-  try {
-    const domains = await parseCsvFile(file);
-    if (domains.length === 0) {
-      alert("Nenhum domínio válido encontrado");
-      return;
-    }
-    await processBatch(domains);
-  } catch (error) {
-    alert("Erro: " + error.message);
-  }
-});
-const DNS_ENDPOINT = "https://dns.google/resolve";
-const BRASIL_API = "https://brasilapi.com.br/api/cnpj/v1/";
-const JINA_PROXY = "https://r.jina.ai/";
-
-// DOM
-const form = document.querySelector("#lookup-form");
-const input = document.querySelector("#domain-input");
-const csvUpload = document.querySelector("#csv-upload");
-const statusText = document.querySelector("#status-text");
-const progressContainer = document.querySelector("#progress-container");
-const progressFill = document.querySelector("#progress-fill");
-const resultsContainer = document.querySelector("#results-container");
-const domainName = document.querySelector("#domain-name");
-const organizationName = document.querySelector("#organization-name");
-const cnpjDisplay = document.querySelector("#cnpj-display");
-const mxDisplay = document.querySelector("#mx-display");
-const batchResultsContainer = document.querySelector("#batch-results-container");
-const batchResults = document.querySelector("#batch-results");
-
-// Templates
-const cnpjTemplate = document.querySelector("#cnpj-card");
-const mxTemplate = document.querySelector("#mx-card");
-const batchTemplate = document.querySelector("#batch-item");
-
-// Utils
-function normalizeDomain(value) {
-  const cleaned = value
-    .toLowerCase()
-    .replace(/^https?:\/\//, "")
-    .replace(/^www\./, "")
-    .replace(/\/.*$/, "")
-    .trim();
-
-  if (!cleaned || !/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(cleaned)) {
-    return null;
-  }
-
-  return cleaned;
-}
-
-function validateCnpj(value) {
-  const digits = String(value).replace(/\D/g, "");
-  
-  if (digits.length !== 14) return false;
-  if (/^(\d)\1{13}$/.test(digits)) return false;
-  
-  let sum = 0, multiplier = 5;
-  for (let i = 0; i < 8; i++) {
-    sum += parseInt(digits[i]) * multiplier;
-    multiplier = multiplier === 2 ? 9 : multiplier - 1;
-  }
-  let remainder = sum % 11;
-  const firstDigit = remainder < 2 ? 0 : 11 - remainder;
-  
-  if (parseInt(digits[8]) !== firstDigit) return false;
-  
-  sum = 0;
-  multiplier = 6;
-  for (let i = 0; i < 9; i++) {
-    sum += parseInt(digits[i]) * multiplier;
-    multiplier = multiplier === 2 ? 9 : multiplier - 1;
-  }
-  remainder = sum % 11;
-  const secondDigit = remainder < 2 ? 0 : 11 - remainder;
-  
-  return parseInt(digits[10]) === secondDigit;
-}
-
-function formatCnpj(value) {
-  const digits = String(value).replace(/\D/g, "");
-  if (digits.length !== 14) return value;
-  return digits.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, "$1.$2.$3/$4-$5");
-}
-
-function extractCnpjs(text) {
-  const cnpjs = new Set();
-  
-  const patterns = [
-    /\b\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}\b/g,
-    /\b\d{2}[\s\-.]?\d{3}[\s\-.]?\d{3}[\s\/\-.]?\d{4}[\s\-.]?\d{2}\b/g,
-    /\b\d{14}\b/g,
-    /cnpj[\s:]*(\d{2}[\s\-.]?\d{3}[\s\-.]?\d{3}[\s\/\-.]?\d{4}[\s\-.]?\d{2})/gi,
-    /(?:empresa|razao[\s_-]social|cnpj)[\s:=]*(\d{2}[\s\-./]*\d{3}[\s\-./]*\d{3}[\s\-./]*\d{4}[\s\-./]*\d{2})/gi,
-  ];
-  
-  for (const pattern of patterns) {
-    const matches = text.match(pattern);
-    if (matches) {
-      matches.forEach(match => {
-        const digits = match.replace(/\D/g, "");
-        if (digits.length === 14 && validateCnpj(digits)) {
-          cnpjs.add(formatCnpj(digits));
-        }
-      });
-    }
-  }
-  
-  return Array.from(cnpjs);
-}
-
-function findOrganization(text) {
-  const jsonLd = text.match(/"name"\s*:\s*"([^"]{5,100})"/i);
-  if (jsonLd?.[1]) return jsonLd[1].trim();
-  
-  const og = text.match(/property="og:title"\s+content="([^"]{5,100})"/i);
-  if (og?.[1]) return og[1].trim();
-  
-  const copyright = text.match(/(?:©|copyright)\s+([^.\n|]{5,100})/i);
-  if (copyright?.[1]) return copyright[1].trim();
-  
-  return null;
-}
-
-function getProviderName(host) {
-  const normalized = host.toLowerCase();
-  
-  const providers = {
-    "google": "Google Workspace",
-    "outlook": "Microsoft 365",
-    "hotmail": "Microsoft 365",
-    "microsoft": "Microsoft 365",
-    "zoho": "Zoho Mail",
-    "amazonses": "Amazon SES",
-    "sendgrid": "SendGrid",
-    "mailgun": "Mailgun",
-    "awsemailsupport": "AWS SES",
-  };
-  
-  for (const [key, provider] of Object.entries(providers)) {
-    if (normalized.includes(key)) {
-      return provider;
-    }
-  }
-  
-  const parts = normalized.split(".");
-  if (parts.length >= 2) {
-    return parts[parts.length - 2].charAt(0).toUpperCase() + parts[parts.length - 2].slice(1);
-  }
-  
-  return "Outro";
-}
-
-// API Calls
-async function lookupMx(domain) {
-  try {
-    const response = await fetch(`${DNS_ENDPOINT}?name=${encodeURIComponent(domain)}&type=MX`);
-    const data = await response.json();
-    const answers = data.Answer || [];
-    
-    return answers.map(record => {
-      const [priority, ...hostParts] = String(record.data).split(" ");
-      const host = hostParts.join(" ").replace(/\.$/, "");
-      return { host, priority };
-    }).filter(r => r.host);
-  } catch (e) {
-    console.error("MX lookup failed:", e);
-    return [];
-  }
-}
-
-async function fetchPage(domain) {
-  try {
-    const response = await fetch(`${JINA_PROXY}http://${domain}`, {
-      signal: AbortSignal.timeout(8000)
-    });
-    
-    if (!response.ok) {
-      console.warn(`HTTP ${response.status} for ${domain}`);
-      return null;
-    }
-    
-    return await response.text();
-  } catch (e) {
-    console.error(`Error fetching ${domain}:`, e.message);
-    return null;
-  }
-}
-
-async function enrichCnpj(cnpj) {
-  try {
-    const response = await fetch(`${BRASIL_API}${cnpj.replace(/\D/g, "")}`);
-    if (!response.ok) throw new Error("Not found");
-    
-    const data = await response.json();
-    return {
-      company: data.nome_fantasia || data.razao_social,
-      status: data.descricao_situacao_cadastral,
-      city: data.municipio,
-      state: data.uf
-    };
-  } catch (e) {
-    return { company: "Empresa não identificada", status: "", city: "", state: "" };
-  }
-}
-
-// Main
-async function analyzeDomain(domain) {
-  const normalized = normalizeDomain(domain);
-  if (!normalized) {
-    alert("Domínio inválido");
-    return;
-  }
-  
-  statusText.textContent = "Buscando...";
-  progressContainer.style.display = "block";
-  resultsContainer.style.display = "none";
-  
-  try {
-    const [mxRecords, pageHtml] = await Promise.all([
-      lookupMx(normalized),
-      fetchPage(normalized)
-    ]);
-    
-    let cnpjs = [];
-    if (pageHtml) {
-      cnpjs = extractCnpjs(pageHtml);
-    }
-    
-    const enrichedCnpjs = await Promise.all(
-      cnpjs.map(async cnpj => ({
-        formatted: cnpj,
-        ...await enrichCnpj(cnpj)
-      }))
-    );
-    
-    let organization = null;
-    if (pageHtml) {
-      organization = findOrganization(pageHtml);
-    }
-    
-    renderResults(normalized, organization, enrichedCnpjs, mxRecords);
-    
-  } catch (e) {
-    console.error(e);
-    statusText.textContent = "Erro na pesquisa";
-    progressContainer.style.display = "none";
-  }
-}
-
-function renderResults(domain, organization, cnpjs, mxRecords) {
-  progressContainer.style.display = "none";
-  resultsContainer.style.display = "block";
-  
-  domainName.textContent = domain;
-  organizationName.textContent = organization || "Não identificada";
-  
-  if (cnpjs.length === 0) {
-    cnpjDisplay.innerHTML = '<p class="empty">Não encontrado</p>';
-  } else {
-    cnpjDisplay.innerHTML = cnpjs.map(cnpj => {
-      const fragment = cnpjTemplate.content.cloneNode(true);
-      fragment.querySelector("[data-cnpj]").textContent = cnpj.formatted;
-      fragment.querySelector("[data-company]").textContent = cnpj.company;
-      
-      const meta = [];
-      if (cnpj.status) meta.push(cnpj.status);
-      if (cnpj.city) meta.push(`${cnpj.city}/${cnpj.state}`);
-      fragment.querySelector("[data-meta]").textContent = meta.join(" • ") || "Sem dados";
-      
-      return fragment;
-    }).map(f => f.firstElementChild.outerHTML).join("");
-  }
-  
-  const providers = new Set();
-  if (mxRecords.length === 0) {
-    mxDisplay.innerHTML = '<p class="empty">Nenhum registro</p>';
-  } else {
-    mxRecords.forEach(record => {
-      const provider = getProviderName(record.host);
-      providers.add(provider);
-    });
-    
-    mxDisplay.innerHTML = Array.from(providers).map(provider => {
-      const fragment = mxTemplate.content.cloneNode(true);
-      fragment.querySelector("[data-provider]").textContent = provider;
-      fragment.querySelector("[data-details]").textContent = `Detectado na infraestrutura de email`;
-      return fragment;
-    }).map(f => f.firstElementChild.outerHTML).join("");
-  }
-  
-  statusText.textContent = `✓ Pesquisa concluída para ${domain}`;
-}
-
-async function processBatch(domains) {
-  batchResultsContainer.style.display = "block";
-  batchResults.innerHTML = "";
-  statusText.textContent = `Processando ${domains.length} domínios...`;
-  progressContainer.style.display = "block";
-  
-  const results = [];
-  
-  for (let i = 0; i < domains.length; i++) {
-    const domain = domains[i];
-    const percent = Math.round((i / domains.length) * 100);
-    progressFill.style.width = percent + "%";
-    
-    try {
-      const [mxRecords, pageHtml] = await Promise.all([
-        lookupMx(domain),
-        fetchPage(domain)
-      ]);
-      
-      let cnpjs = [];
-      let organization = null;
-      
-      if (pageHtml) {
-        cnpjs = extractCnpjs(pageHtml);
-        organization = findOrganization(pageHtml);
-      }
-      
-      const enrichedCnpjs = await Promise.all(
-        cnpjs.slice(0, 1).map(async cnpj => ({
-          formatted: cnpj,
-          ...await enrichCnpj(cnpj)
-        }))
-      );
-      
-      const providers = new Set();
-      mxRecords.forEach(r => providers.add(getProviderName(r.host)));
-      
-      results.push({
-        domain,
-        cnpj: enrichedCnpjs[0]?.formatted || "-",
-        company: enrichedCnpjs[0]?.company || "-",
-        email: Array.from(providers).join(", ") || "-",
-        status: enrichedCnpjs.length > 0 ? "success" : "warning"
-      });
-    } catch (e) {
-      results.push({
-        domain,
-        cnpj: "-",
-        company: "Erro",
-        email: "-",
-        status: "error"
-      });
-    }
-    
-    await new Promise(r => setTimeout(r, 500));
-  }
-  
-  progressFill.style.width = "100%";
-  renderBatchResults(results);
-  statusText.textContent = `Análise de ${domains.length} domínios concluída`;
-  progressContainer.style.display = "none";
-}
-
-function renderBatchResults(results) {
-  batchResults.innerHTML = results.map(result => {
-    const fragment = batchTemplate.content.cloneNode(true);
-    fragment.querySelector("[data-domain]").textContent = result.domain;
-    fragment.querySelector("[data-cnpj]").textContent = result.cnpj;
-    fragment.querySelector("[data-company]").textContent = result.company;
-    fragment.querySelector("[data-email]").textContent = result.email;
-    
-    const badge = fragment.querySelector(".badge");
-    badge.textContent = result.status === "success" ? "✓ OK" : result.status === "warning" ? "⚠ Parcial" : "✗ Erro";
-    badge.className = `badge ${result.status}`;
-    
-    return fragment;
-  }).map(f => f.firstElementChild.outerHTML).join("");
-}
-
-async function parseCsvFile(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      try {
-        const text = e.target.result;
-        const lines = text.split("\n")
-          .map(l => l.trim())
-          .filter(l => l.length > 0 && l.includes("."));
-        
-        const domains = lines.map(line => {
-          try {
-            const url = new URL(line.startsWith("http") ? line : `http://${line}`);
-            return url.hostname;
-          } catch {
-            return line;
-          }
-        }).filter(d => normalizeDomain(d));
-        
-        const unique = [...new Set(domains)];
-        resolve(unique);
-      } catch (e) {
-        reject(new Error("Erro ao ler arquivo: " + e.message));
-      }
-    };
-    reader.onerror = () => reject(new Error("Erro ao ler arquivo"));
-    reader.readAsText(file);
-  });
-}
-
-// Events
-form.addEventListener("submit", (e) => {
-  e.preventDefault();
-  analyzeDomain(input.value);
-});
-
-csvUpload.addEventListener("change", async (e) => {
-  const file = e.target.files[0];
-  if (!file) return;
-  
-  try {
-    const domains = await parseCsvFile(file);
-    if (domains.length === 0) {
-      alert("Nenhum domínio válido encontrado");
-      return;
-    }
-    resultsContainer.style.display = "none";
-    await processBatch(domains);
-  } catch (e) {
-    alert("Erro: " + e.message);
-  }
-});
-const DNS_ENDPOINT = "https://dns.google/resolve";
-const BRASIL_API = "https://brasilapi.com.br/api/cnpj/v1/";
-const JINA_PROXY = "https://r.jina.ai/";
-
-// Elementos do DOM
-const form = document.querySelector("#lookup-form");
-const input = document.querySelector("#domain-input");
-const csvUpload = document.querySelector("#csv-upload");
-const statusText = document.querySelector("#status-text");
-const progressContainer = document.querySelector("#progress-container");
-const progressFill = document.querySelector("#progress-fill");
-const resultsContainer = document.querySelector("#results-container");
-const domainName = document.querySelector("#domain-name");
-const organizationName = document.querySelector("#organization-name");
-const cnpjDisplay = document.querySelector("#cnpj-display");
-const mxDisplay = document.querySelector("#mx-display");
-const batchResultsContainer = document.querySelector("#batch-results-container");
-const batchResults = document.querySelector("#batch-results");
-
-// Templates
-const cnpjTemplate = document.querySelector("#cnpj-card");
-const mxTemplate = document.querySelector("#mx-card");
-const batchTemplate = document.querySelector("#batch-item");
-
-form.addEventListener("submit", async (event) => {
-  event.preventDefault();
-
-  const rawDomain = input.value.trim();
-  const normalized = normalizeDomain(rawDomain);
-
-  if (!normalized) {
-    setStatus("Dominio invalido", "Digite um dominio valido, como empresa.com.br ou mail.empresa.com.");
-    return;
-  }
-
-  batchResultsSection.style.display = "none";
-  prepareLoadingState(normalized.displayDomain, 1);
-
-  try {
-    const [mxRecords, clues] = await Promise.all([
-      lookupMx(normalized.rootDomain),
-      inspectDomain(normalized.rootDomain),
-    ]);
-
-    updateProgress(100, "Processando resultados...");
-
-    const cnpjs = uniqueBy(clues.flatMap((clue) => clue.cnpjs), (item) => item.formatted);
-    const enrichedCnpjs = await enrichCnpjs(cnpjs);
-    renderSummary(normalized, clues, enrichedCnpjs);
-    renderMx(mxRecords);
-    renderCnpjs(enrichedCnpjs);
-    renderClues(clues);
-
-    const organization = clues.find((clue) => clue.organization)?.organization || inferOrganization(clues);
-    setStatus(
-      "Analise concluida",
-      organization
-        ? `Encontramos sinais de ${organization}, ${enrichedCnpjs.length} CNPJ(s) candidato(s) e ${mxRecords.length} registro(s) MX para ${normalized.rootDomain}.`
-        : `Coleta finalizada para ${normalized.rootDomain} com ${mxRecords.length} registro(s) MX e ${enrichedCnpjs.length} CNPJ(s) candidato(s).`
-    );
-    hideProgress();
-  } catch (error) {
-    console.error(error);
-    setStatus(
-      "Falha na coleta",
-      "Nao foi possivel concluir a pesquisa. Verifique a conexao do navegador ou teste novamente em alguns instantes."
-    );
-    mxResults.textContent = "A consulta de MX nao retornou dados.";
-    cnpjResults.textContent = "A pesquisa de CNPJ nao retornou dados.";
-    clueResults.textContent = "Nao foi possivel carregar pistas do site.";
-    hideProgress();
-  }
-});
-
-csvUpload.addEventListener("change", async (event) => {
-  const file = event.target.files[0];
-  if (!file) return;
-
-  batchResultsSection.style.display = "none";
-  try {
-    const domains = await parseCsvFile(file);
-    
-    if (!domains || domains.length === 0) {
-      setStatus("Erro na planilha", "Nenhum dominio encontrado. Verifique o formato do arquivo.");
-      return;
-    }
-
-    await processBatch(domains);
-  } catch (error) {
-    console.error(error);
-    setStatus("Erro ao processar", `Erro ao ler o arquivo: ${error.message}`);
-  }
-});
-
-uploadLabel.addEventListener("click", () => csvUpload.click());
-
-function normalizeDomain(value) {
-  const cleaned = value
-    .toLowerCase()
-    .replace(/^https?:\/\//, "")
-    .replace(/^www\./, "")
-    .replace(/\/.*$/, "")
-    .trim();
-
-  if (!cleaned || !/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(cleaned)) {
-    return null;
-  }
-
-  const parts = cleaned.split(".").filter(Boolean);
-  const suffix = parts.slice(-2).join(".");
-  const usesBrSecondLevel = parts.length > 2 && BR_SECOND_LEVEL_DOMAINS.has(suffix);
-  const rootDomain = usesBrSecondLevel ? parts.slice(-3).join(".") : parts.length > 2 ? parts.slice(-2).join(".") : cleaned;
-
-  return {
-    displayDomain: cleaned,
-    rootDomain,
-  };
-}
-
-async function lookupMx(domain) {
-  const url = `${DNS_ENDPOINT}?name=${encodeURIComponent(domain)}&type=MX`;
-  const response = await fetch(url);
-  const data = await response.json();
-  const answers = data.Answer || [];
-
-  return answers
-    .map((record) => {
-      const [priority, ...hostParts] = String(record.data).split(" ");
-      const host = hostParts.join(" ").replace(/\.$/, "");
-      return {
-        host,
-        priority,
-        ttl: record.TTL,
-        provider: classifyMxProvider(host),
-      };
-    })
-    .filter((record) => record.host);
-}
-
-function classifyMxProvider(host) {
-  const normalized = host.toLowerCase();
-  
-  const providers = {
-    "Google Workspace": ["aspmx.l.google.com", "google.com"],
-    "Microsoft 365": ["outlook.com", "hotmail.com", "microsoft.com"],
-    "Zoho Mail": ["zoho.com"],
-    "Amazon SES": ["amazonses.com"],
-    "SendGrid": ["sendgrid.com"],
-    "Mailgun": ["mailgun.org", "mailgun.com"],
-    "AWS": ["awsemailsupport.com"],
-  };
-  
-  for (const [provider, domains] of Object.entries(providers)) {
-    if (domains.some(d => normalized.includes(d))) {
-      return provider;
-    }
-  }
-  
-  return "Provedor desconhecido";
-}
-
-async function inspectDomain(domain) {
-  const tasks = COMMON_PATHS.map(async (path) => fetchClueForPath(domain, path));
-
-  const results = await Promise.all(tasks);
-  return results.filter(Boolean);
-}
-
-async function fetchClueForPath(domain, path) {
-  const pageUrl = `http://${domain}${path}`;
-
-  try {
-    const response = await fetch(`${CONTENT_PROXY}${domain}${path}`);
-    if (!response.ok) {
-      return null;
-    }
-
-    const text = await response.text();
-    if (!text || text.length < 80) {
-      return null;
-    }
-
-    const clue = parseClue(text, pageUrl);
-    
-    // Se não encontrou CNPJ e temos acesso ao HTML, busca de forma mais agressiva
-    if (clue && clue.cnpjs.length === 0) {
-      const aggressiveCnpjs = extractCnpjsAggressive(text);
-      clue.cnpjs = aggressiveCnpjs.map((cnpj) => ({
-        raw: cnpj,
-        digits: onlyDigits(cnpj),
-        formatted: formatCnpj(cnpj),
-        sourceUrl: pageUrl,
-      }));
-    }
-    
-    return clue;
-  } catch {
-    return null;
-  }
-}
-
-function parseClue(text, sourceUrl) {
-  const lines = text.split("\n").map((line) => line.trim()).filter(Boolean);
-  const heading = lines.slice(0, 8).join(" ").slice(0, 160);
-  const organization = findOrganization(text);
-  const cnpjs = extractCnpjs(text).map((cnpj) => ({
-    raw: cnpj,
-    digits: onlyDigits(cnpj),
-    formatted: formatCnpj(cnpj),
-    sourceUrl,
-  }));
-
-  return {
-    sourceUrl,
-    label: guessPageLabel(sourceUrl),
-    title: organization || heading || sourceUrl,
-    body: summarizeText(lines),
-    organization,
-    cnpjs,
-  };
-}
-
-function extractCnpjs(text) {
-  const patterns = [
-    // Padrão formatado: XX.XXX.XXX/XXXX-XX
-    /\b\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}\b/g,
-    // Padrão com espaços/caracteres: XX XXX XXX XXXX XX
-    /\b\d{2}[\s\-.]?\d{3}[\s\-.]?\d{3}[\s\/\-.]?\d{4}[\s\-.]?\d{2}\b/g,
-    // Padrão sem formatação: 14 dígitos
-    /\b\d{14}\b/g,
-    // CNPJ após "CNPJ:" ou "CNPJ ="
-    /(?:cnpj|cnpj:|cnpj\s*=|cnpj\s*:)[\s]*([\d.\-/\s]+)/gi,
-    // Padrão em contexto de rodapé
-    /(?:empresa|cnpj|registr)\s*(?:n[°º]|:)?\s*([\d.\-/\s]{14,20})/gi,
-  ];
-  
-  const matches = new Set();
-  
-  for (const pattern of patterns) {
-    const found = text.match(pattern);
-    if (found) {
-      found.forEach(match => {
-        // Extrai números da match
-        const digits = match.replace(/\D/g, '');
-        if (digits.length === 14 && validateCnpj(match)) {
-          matches.add(formatCnpj(digits));
-        }
-      });
-    }
-  }
-  
-  return Array.from(matches);
-}
-
-function findOrganization(text) {
-  // Schema.org / JSON-LD
-  const jsonLdMatch = text.match(/"name"\s*:\s*"([^"]+)"/i);
-  if (jsonLdMatch?.[1]) {
-    return jsonLdMatch[1].trim();
-  }
-
-  // Meta tags OpenGraph
-  const ogMatch = text.match(/property="og:title"\s+content="([^"]+)"/i);
-  if (ogMatch?.[1]) {
-    return ogMatch[1].trim();
-  }
-
-  // Copyright/rodapé
-  const copyrightMatch = text.match(/(?:copyright|todos os direitos reservados|©)\s+([^.\n|]{3,90})/i);
-  if (copyrightMatch?.[1]) {
-    return copyrightMatch[1].trim();
-  }
-  
-  // Razão social em meta tags
-  const companyMatch = text.match(/(?:company|empresa|razao[_-]social)\s*[=:]\s*["']?([^"'\n]{5,90})/i);
-  if (companyMatch?.[1]) {
-    return companyMatch[1].trim();
-  }
-
-  return null;
-}
-
-function extractCnpjsAggressive(text) {
-  // Busca ainda mais agressiva - procura em todo o HTML
-  const cnpjs = new Set();
-  
-  // Busca em atributos data-*
-  const dataMatches = text.match(/data-(?:cnpj|company|empresa)[^>]*[=\s](["']?[\d.\-/\s]+["']?)/gi);
-  if (dataMatches) {
-    dataMatches.forEach(m => {
-      const digits = m.replace(/\D/g, '');
-      if (digits.length === 14 && validateCnpj(m)) {
-        cnpjs.add(formatCnpj(m));
-      }
-    });
-  }
-  
-  // Busca em scripts JSON
-  const scriptMatches = text.match(/<script[^>]*>([\s\S]*?)<\/script>/gi);
-  if (scriptMatches) {
-    scriptMatches.forEach(script => {
-      try {
-        const matches = script.match(/\d{2}\.?\d{3}\.?\d{3}\/?\d{4}-?\d{2}/g);
-        if (matches) {
-          matches.forEach(m => {
-            if (validateCnpj(m)) {
-              cnpjs.add(formatCnpj(m));
-            }
-          });
-        }
-      } catch (e) {
-        // Ignora erros de parsing
-      }
-    });
-  }
-  
-  return Array.from(cnpjs);
-}
-
-function summarizeText(lines) {
-  return lines
-    .filter((line) => line.length > 30)
-    .slice(0, 2)
-    .join(" ")
-    .slice(0, 240) || "Conteudo institucional localizado, mas sem resumo suficiente.";
-}
-
-function guessPageLabel(url) {
-  if (url.includes("/contato")) return "Contato";
-  if (url.includes("/sobre")) return "Sobre";
-  if (url.includes("/empresa")) return "Empresa";
-  if (url.includes("/quem-somos")) return "Quem somos";
-  if (url.includes("/institucional")) return "Institucional";
-  return "Pagina principal";
-}
-
-async function enrichCnpjs(cnpjs) {
-  const tasks = cnpjs.map(async (item) => {
-    if (item.digits.length !== 14) {
-      return {
-        ...item,
-        companyName: "Formato localizado, mas incompleto",
-        extra: `Origem: ${item.sourceUrl}`,
-      };
-    }
-
-    try {
-      const response = await fetch(`${BRASIL_API}${item.digits}`);
-      if (!response.ok) {
-        throw new Error("cnpj enrichment failed");
-      }
-
-      const company = await response.json();
-      return {
-        ...item,
-        companyName: company.razao_social || company.nome_fantasia || "Empresa localizada",
-        extra: [company.descricao_situacao_cadastral, company.municipio, company.uf].filter(Boolean).join(" | "),
-      };
-    } catch {
-      return {
-        ...item,
-        companyName: "CNPJ identificado no site",
-        extra: `Nao foi possivel enriquecer via BrasilAPI. Origem: ${item.sourceUrl}`,
-      };
-    }
-  });
-
-  return Promise.all(tasks);
-}
-
-function renderSummary(domainData, clues, cnpjs) {
-  const organization = inferOrganization(clues);
-  const values = [
-    domainData.displayDomain,
-    domainData.rootDomain,
-    organization || "Nao identificado",
-    cnpjs.length ? `${cnpjs.length} candidato(s)` : "Nenhum localizado",
-  ];
-
-  [...summaryList.querySelectorAll("dd")].forEach((element, index) => {
-    element.textContent = values[index];
-  });
-}
-
-function renderMx(records) {
-  mxResults.innerHTML = "";
-
-  if (!records.length) {
-    mxResults.textContent = "Nenhum registro MX encontrado.";
-    mxResults.classList.add("empty-state");
-    return;
-  }
-
-  mxResults.classList.remove("empty-state");
-
-  records.forEach((record) => {
-    const fragment = mxTemplate.content.cloneNode(true);
-    fragment.querySelector("[data-host]").textContent = record.host;
-    fragment.querySelector("[data-priority]").textContent = `Prioridade ${record.priority}`;
-    fragment.querySelector("[data-meta]").textContent = `TTL: ${record.ttl}s • ${record.provider}`;
-    mxResults.appendChild(fragment);
-  });
-}
-
-function renderCnpjs(cnpjs) {
-  cnpjResults.innerHTML = "";
-
-  if (!cnpjs.length) {
-    cnpjResults.textContent = "Nenhum CNPJ foi identificado nas paginas verificadas.";
-    cnpjResults.classList.add("empty-state");
-    return;
-  }
-
-  cnpjResults.classList.remove("empty-state");
-
-  cnpjs.forEach((item) => {
-    const fragment = cnpjTemplate.content.cloneNode(true);
-    fragment.querySelector("[data-cnpj]").textContent = item.formatted || item.raw;
-    fragment.querySelector("[data-source]").textContent = "Evidencia publica";
-    fragment.querySelector("[data-company]").textContent = item.companyName;
-    fragment.querySelector("[data-extra]").textContent = item.extra;
-    cnpjResults.appendChild(fragment);
-  });
-}
-
-function renderClues(clues) {
-  clueResults.innerHTML = "";
-
-  if (!clues.length) {
-    clueResults.textContent = "Nao encontramos paginas acessiveis para extrair pistas.";
-    clueResults.classList.add("empty-state");
-    return;
-  }
-
-  clueResults.classList.remove("empty-state");
-
-  clues.forEach((clue) => {
-    const fragment = clueTemplate.content.cloneNode(true);
-    fragment.querySelector("[data-label]").textContent = clue.label;
-    fragment.querySelector("[data-title]").textContent = clue.title;
-    fragment.querySelector("[data-body]").textContent = clue.body;
-    const link = fragment.querySelector("[data-link]");
-    link.href = clue.sourceUrl;
-    clueResults.appendChild(fragment);
-  });
-}
-
-function prepareLoadingState(domain, totalItems = 1) {
-  setStatus("Coletando dados", `Consultando MX, paginas principais e possiveis CNPJs publicados para ${domain}.`);
-  mxResults.textContent = "Buscando registros MX...";
-  cnpjResults.textContent = "Varrendo paginas por possiveis CNPJs...";
-  clueResults.textContent = "Reunindo pistas institucionais...";
-  showProgress(totalItems);
-}
-
-function setStatus(title, description) {
-  statusPanelTitle.textContent = title;
-  statusText.textContent = description;
-}
-
-function inferOrganization(clues) {
-  return clues.find((clue) => clue.organization)?.organization || null;
-}
-
-function onlyDigits(value) {
-  return String(value).replace(/\D/g, "");
-}
-
-function formatCnpj(value) {
-  const digits = onlyDigits(value);
-  if (digits.length !== 14) {
-    return value;
-  }
-
-  return digits.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, "$1.$2.$3/$4-$5");
-}
-
-function validateCnpj(value) {
-  const digits = onlyDigits(value);
-  
-  if (digits.length !== 14) {
-    return false;
-  }
-  
-  // Rejeita sequencias repetidas
-  if (/^(\d)\1{13}$/.test(digits)) {
-    return false;
-  }
-  
-  // Calcula primeiro digito verificador
-  let sum = 0;
-  let multiplier = 5;
-  for (let i = 0; i < 8; i++) {
-    sum += parseInt(digits[i]) * multiplier;
-    multiplier = multiplier === 2 ? 9 : multiplier - 1;
-  }
-  let remainder = sum % 11;
-  const firstDigit = remainder < 2 ? 0 : 11 - remainder;
-  
-  if (parseInt(digits[8]) !== firstDigit) {
-    return false;
-  }
-  
-  // Calcula segundo digito verificador
-  sum = 0;
-  multiplier = 6;
-  for (let i = 0; i < 9; i++) {
-    sum += parseInt(digits[i]) * multiplier;
-    multiplier = multiplier === 2 ? 9 : multiplier - 1;
-  }
-  remainder = sum % 11;
-  const secondDigit = remainder < 2 ? 0 : 11 - remainder;
-  
-  return parseInt(digits[9]) === secondDigit;
-}
-
-function uniqueBy(items, selector) {
-  const seen = new Set();
-  return items.filter((item) => {
-    const key = selector(item);
-    if (seen.has(key)) {
-      return false;
-    }
-    seen.add(key);
-    return true;
-  });
-}
-
-function showProgress(totalItems = 1) {
-  progressContainer.style.display = "block";
-  statusText.style.display = "none";
-  updateProgress(0, `Processando 0 de ${totalItems}...`);
-}
-
-function hideProgress() {
-  progressContainer.style.display = "none";
-  statusText.style.display = "block";
-}
-
-function updateProgress(percent, text) {
-  progressFill.style.width = percent + "%";
-  progressText.textContent = text;
-}
-
-async function parseCsvFile(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      try {
-        const text = e.target.result;
-        let lines = [];
-        
-        // Se for XLSX, tenta interpretar como CSV básico
-        if (file.name.endsWith('.xlsx')) {
-          // Nota: Para XLSX completo, seria necessário usar uma biblioteca como xlsx
-          // Por enquanto, tentamos extrair URLs básicas
-          lines = text.split('\n')
-            .map(line => line.trim())
-            .filter(line => line.length > 0 && (line.includes('.') || line.match(/^https?:/)));
-        } else {
-          // CSV parsing
-          lines = text.split('\n')
-            .map(line => {
-              // Remove aspas se existirem
-              return line.replace(/^["']|["']$/g, '').trim();
-            })
-            .filter(line => line.length > 0);
-        }
-
-        // Normaliza e valida domínios
-        const domains = lines
-          .map(line => {
-            // Extrai domínio se for URL completa
-            if (line.includes('://')) {
-              return new URL(line).hostname;
-            }
-            return line;
+        if (!res.ok) continue;
+        const data = await res.json();
+        return (data.Answer || [])
+          .filter((a) => a.type === 15)
+          .map((a) => {
+            const [prio, host] = String(a.data).split(/\s+/);
+            const clean = (host || "").replace(/\.$/, "");
+            return { priority: Number(prio), host: clean, provider: mxProvider(clean) };
           })
-          .filter(domain => domain && domain.includes('.'))
-          .map(domain => normalizeDomain(domain))
-          .filter(Boolean)
-          .map(d => d.rootDomain);
-
-        // Remove duplicatas
-        const unique = [...new Set(domains)];
-        resolve(unique);
-      } catch (error) {
-        reject(new Error(`Erro ao ler arquivo: ${error.message}`));
-      }
-    };
-    reader.onerror = () => reject(new Error('Erro ao ler o arquivo'));
-    reader.readAsText(file);
+          .sort((a, b) => a.priority - b.priority);
+      } catch { /* tenta o próximo servidor */ }
+    }
+    throw new Error("DNS indisponível");
   });
 }
 
-async function processBatch(domains) {
-  batchResults.innerHTML = "";
-  batchResultsSection.style.display = "block";
-  mxResults.innerHTML = "";
-  cnpjResults.innerHTML = "";
-  clueResults.innerHTML = "";
-  
-  prepareLoadingState(`${domains.length} domínios`, domains.length);
+function mxProvider(host) {
+  const h = host.toLowerCase();
+  const known = [
+    ["Google Workspace", /google(mail)?\.com$/],
+    ["Microsoft 365", /(outlook|protection\.outlook|office365)\.com$/],
+    ["Zoho Mail", /zoho\.(com|eu|in)$/],
+    ["Locaweb", /locaweb\.com\.br$/],
+    ["KingHost", /kinghost\.net$/],
+    ["UOL Host", /uolhost|uol\.com\.br$/],
+    ["Hostgator", /hostgator|websitewelcome\.com$/],
+    ["Titan", /titan\.email$/],
+    ["Proofpoint", /pphosted\.com$/],
+    ["Mimecast", /mimecast\.com$/],
+  ];
+  return known.find(([, re]) => re.test(h))?.[0] || "Outro / próprio";
+}
 
-  const results = [];
-  
-  for (let i = 0; i < domains.length; i++) {
-    const domain = domains[i];
-    updateProgress(Math.floor((i / domains.length) * 100), `Processando ${i + 1} de ${domains.length}: ${domain}`);
-    
-    try {
-      const [mxRecords, clues] = await Promise.all([
-        lookupMx(domain).catch(() => []),
-        inspectDomain(domain).catch(() => []),
-      ]);
+/** 2. Lê o site e procura CNPJs no texto. Home primeiro; se não tiver CNPJ, as outras páginas em paralelo. */
+async function scanSite(host, { maxPages = SITE_PATHS.length } = {}) {
+  const read = async (path) => {
+    const url = `https://${host}${path}`;
+    return { url, ...(await cached("page:" + url, () => readPage(url))) };
+  };
+  const [home, ...rest] = SITE_PATHS.slice(0, maxPages);
+  const pages = [await read(home)];
+  // Se o leitor bloqueou (limite), não adianta insistir.
+  if (!pages[0].cnpjs?.length && pages[0].status !== "limit") pages.push(...(await Promise.all(rest.map(read))));
+  return {
+    pages,
+    title: pages.find((p) => p.title)?.title || null,
+    cnpjs: pages.flatMap((p) => p.cnpjs || []),
+  };
+}
 
-      const cnpjs = uniqueBy(clues.flatMap((clue) => clue.cnpjs), (item) => item.formatted);
-      const enrichedCnpjs = await enrichCnpjs(cnpjs);
-      const organization = clues.find((clue) => clue.organization)?.organization || inferOrganization(clues);
+async function readPage(url) {
+  let res;
+  try {
+    res = await fetchWithTimeout(API.reader + url, { timeout: 25000 });
+  } catch {
+    return { status: "error", note: "tempo esgotado" };
+  }
+  if (res.status === 429) return { status: "limit", note: "limite do leitor de páginas (aguarde 1 min)" };
+  if (!res.ok) return { status: "error", note: `HTTP ${res.status}` };
 
-      results.push({
-        domain,
-        mxCount: mxRecords.length,
-        cnpjCount: enrichedCnpjs.length,
-        organization,
-        cnpjs: enrichedCnpjs,
-        error: false,
-      });
-    } catch (error) {
-      console.error(`Erro ao processar ${domain}:`, error);
-      results.push({
-        domain,
-        mxCount: 0,
-        cnpjCount: 0,
-        organization: null,
-        cnpjs: [],
-        error: true,
+  const text = await res.text();
+  const warn = text.match(/^Warning: Target URL returned error (\d+)/m);
+  if (warn) return { status: "error", note: `site respondeu ${warn[1]}` };
+
+  return {
+    status: "ok",
+    title: text.match(/^Title:\s*(.+)$/m)?.[1]?.trim() || null,
+    cnpjs: findCnpjsInText(text, url),
+  };
+}
+
+/** Acha CNPJs válidos e guarda o trecho ao redor, para mostrar como evidência. */
+function findCnpjsInText(text, url) {
+  const re = /(?<!\d)\d{2}[.\s]?\d{3}[.\s]?\d{3}[/\s]?\d{4}[-\s]?\d{2}(?!\d)/g;
+  const found = new Map();
+  for (const m of text.matchAll(re)) {
+    const digits = onlyDigits(m[0]);
+    if (!isValidCnpj(digits) || found.has(digits)) continue;
+    const before = text.slice(Math.max(0, m.index - 90), m.index);
+    const after = text.slice(m.index + m[0].length, m.index + m[0].length + 40);
+    const snippet = (before + m[0] + after).replace(/\s+/g, " ").replace(/[*_#[\]]/g, "").trim();
+    // CNPJ citado ao lado de "desenvolvido por", "agência" etc. costuma ser do fornecedor, não do dono.
+    const thirdParty = /(desenvolvid|criad[oa] por|feito por|ag[eê]ncia|hospedad|powered|parceir|intermedia|pagamento)/i.test(before.slice(-60));
+    const labeled = /cnpj|raz[aã]o social|inscri/i.test(before.slice(-40));
+    found.set(digits, { cnpj: digits, url, snippet, thirdParty, labeled });
+  }
+  return [...found.values()];
+}
+
+/** 3. Dados na Receita (BrasilAPI). */
+function lookupCnpj(cnpj) {
+  return cached("cnpj:" + cnpj, async () => {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const res = await fetchWithTimeout(API.cnpj + cnpj, { timeout: 15000 });
+      if (res.status === 429) { await sleep(2000 * (attempt + 1)); continue; }
+      if (res.status === 404) return { found: false };
+      if (!res.ok) throw new Error(`BrasilAPI ${res.status}`);
+      const d = await res.json();
+      return {
+        found: true,
+        razao: d.razao_social,
+        fantasia: d.nome_fantasia,
+        situacao: d.descricao_situacao_cadastral,
+        cidade: d.municipio ? `${d.municipio}/${d.uf}` : "",
+        abertura: d.data_inicio_atividade,
+        atividade: d.cnae_fiscal_descricao,
+        email: (d.email || "").toLowerCase(),
+        matriz: d.descricao_identificador_matriz_filial,
+      };
+    }
+    throw new Error("BrasilAPI limitou as consultas");
+  });
+}
+
+/* ---------------- análise ---------------- */
+
+const CONF = { alta: 3, media: 2, baixa: 1 };
+
+/**
+ * Junta as evidências de todas as fontes e dá uma nota de confiança a cada CNPJ.
+ * mode "full" lê todas as páginas comuns; "fast" (lote) só lê o site se o RDAP não achar nada.
+ */
+async function analyze(input, { mode = "full", onStep = () => {} } = {}) {
+  const dom = normalizeDomain(input);
+  if (!dom) throw new Error("Domínio inválido");
+  const sources = [];
+  const candidates = new Map();
+  const add = (cnpj, evidence) => {
+    const c = candidates.get(cnpj) || { cnpj, evidence: [] };
+    c.evidence.push(evidence);
+    candidates.set(cnpj, c);
+  };
+
+  onStep("Consultando registro do domínio e DNS…");
+  const [rdap, mx] = await Promise.allSettled([lookupRdap(dom.root), lookupMx(dom.root)]);
+
+  if (rdap.status === "fulfilled") {
+    const r = rdap.value;
+    sources.push({ name: "Registro.br (RDAP)", ok: r.status === "found", skip: r.status === "skip", note: r.note });
+    if (r.status === "found") add(r.cnpj, { kind: "rdap", text: `Titular do domínio ${dom.root}: ${r.name}` });
+  } else {
+    sources.push({ name: "Registro.br (RDAP)", ok: false, note: "falha na consulta" });
+  }
+
+  const mxRecords = mx.status === "fulfilled" ? mx.value : null;
+  sources.push({
+    name: "DNS (MX)",
+    ok: !!mxRecords?.length,
+    note: mxRecords ? (mxRecords.length ? `${mxRecords.length} registro(s)` : "domínio sem MX") : "DNS indisponível",
+  });
+
+  let site = { pages: [], title: null, cnpjs: [] };
+  if (mode === "full" || candidates.size === 0) {
+    onStep("Lendo o site em busca de CNPJ…");
+    site = await scanSite(dom.host, { maxPages: mode === "full" ? SITE_PATHS.length : 3 });
+    for (const p of site.pages) {
+      const path = new URL(p.url).pathname;
+      sources.push({
+        name: `Site ${path}`,
+        ok: p.status === "ok" && p.cnpjs.length > 0,
+        note: p.status === "ok" ? (p.cnpjs.length ? `${p.cnpjs.length} CNPJ(s)` : "sem CNPJ") : p.note,
       });
     }
-    
-    // Delay entre requisições para evitar rate limit
-    if (i < domains.length - 1) {
-      await new Promise(resolve => setTimeout(resolve, 500));
+    for (const c of site.cnpjs) add(c.cnpj, { kind: "site", text: c.snippet, url: c.url, thirdParty: c.thirdParty, labeled: c.labeled });
+  }
+
+  onStep("Confirmando CNPJs na Receita…");
+  const list = [...candidates.values()].slice(0, 5);
+  await Promise.all(list.map(async (c) => {
+    try { c.receita = await lookupCnpj(c.cnpj); } catch (e) { c.receita = { error: e.message }; }
+  }));
+  if (list.length) {
+    const okCount = list.filter((c) => c.receita?.found).length;
+    sources.push({ name: "Receita (BrasilAPI)", ok: okCount > 0, note: `${okCount} de ${list.length} confirmado(s)` });
+  }
+
+  for (const c of list) scoreCandidate(c, dom);
+
+  // Os 8 primeiros dígitos identificam a empresa; o resto, a filial.
+  // Uma filial de um CNPJ já confirmado é da mesma empresa.
+  const strongRoots = new Set(list.filter((c) => c.confidence === "alta").map((c) => c.cnpj.slice(0, 8)));
+  for (const c of list) {
+    if (c.confidence !== "alta" && strongRoots.has(c.cnpj.slice(0, 8)) && c.receita?.found !== false) {
+      c.confidence = "alta";
+      c.reasons.unshift("mesma empresa (outra filial) do CNPJ confirmado");
     }
   }
 
-  updateProgress(100, "Renderizando resultados...");
-  renderBatchResults(results);
-  
-  setStatus(
-    "Análise em lote concluída",
-    `${domains.length} domínios processados. ${results.filter(r => !r.error).length} sucessos, ${results.filter(r => r.error).length} erros.`
-  );
-  
-  hideProgress();
+  list.sort((a, b) => CONF[b.confidence] - CONF[a.confidence] || b.evidence.length - a.evidence.length);
+
+  return { dom, mx: mxRecords, sources, candidates: list, best: list[0] || null, siteTitle: site.title };
 }
 
-function renderBatchResults(results) {
-  batchResults.innerHTML = "";
+function scoreCandidate(c, dom) {
+  const reasons = [];
+  const kinds = new Set(c.evidence.map((e) => e.kind));
+  const emailMatch = c.receita?.email && c.receita.email.endsWith("@" + dom.root);
+  let level = "baixa";
 
-  results.forEach((result) => {
-    const fragment = batchTemplate.content.cloneNode(true);
-    
-    fragment.querySelector("[data-domain]").textContent = result.domain;
-    
-    const statusBadge = fragment.querySelector("[data-status]");
-    statusBadge.textContent = result.error ? "Erro" : "OK";
-    if (result.error) {
-      statusBadge.classList.add("error");
+  if (kinds.has("rdap")) { level = "alta"; reasons.push("é o titular oficial do domínio"); }
+  if (emailMatch) { level = "alta"; reasons.push(`e-mail na Receita é @${dom.root}`); }
+  if (kinds.has("site")) {
+    const ev = c.evidence.filter((e) => e.kind === "site");
+    const allThirdParty = ev.every((e) => e.thirdParty);
+    if (allThirdParty) reasons.push("aparece no site perto de “desenvolvido por / agência” — pode ser fornecedor");
+    else {
+      reasons.push("publicado no próprio site");
+      if (level === "baixa") level = "media";
     }
-    
-    fragment.querySelector("[data-mx-count]").textContent = result.mxCount;
-    fragment.querySelector("[data-cnpj-count]").textContent = result.cnpjCount;
-    fragment.querySelector("[data-organization]").textContent = result.organization || "-";
-    
-    if (result.cnpjs.length > 0) {
-      const cnpjListRow = fragment.querySelector("[data-cnpj-list]");
-      cnpjListRow.style.display = "flex";
-      fragment.querySelector("[data-cnpj-formatted]").textContent = result.cnpjs
-        .map(c => c.formatted || c.raw)
-        .join(", ");
+  }
+  if (c.receita && c.receita.found === false) { level = "baixa"; reasons.push("não existe na Receita"); }
+  if (c.receita?.situacao && c.receita.situacao !== "ATIVA") reasons.push(`situação: ${c.receita.situacao}`);
+
+  c.confidence = level;
+  c.reasons = reasons;
+}
+
+/* ---------------- interface ---------------- */
+
+const $ = (sel) => document.querySelector(sel);
+
+/** Cria elementos sem innerHTML (texto vindo de sites é sempre tratado como texto). */
+function h(tag, attrs = {}, ...children) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v == null || v === false) continue;
+    if (k === "class") el.className = v;
+    else el.setAttribute(k, v);
+  }
+  for (const c of children.flat()) if (c != null && c !== false) el.append(c);
+  return el;
+}
+
+const badge = (level) => h("span", { class: `badge ${level}` },
+  level === "alta" ? "Confiança alta" : level === "media" ? "Confiança média" : "Confiança baixa");
+
+function setStatus(text, { loading = false, error = false } = {}) {
+  $("#status").hidden = !text;
+  $("#status").classList.toggle("error", error);
+  $("#status-text").textContent = text || "";
+  $("#spinner").hidden = !loading;
+}
+
+function setProgress(done, total) {
+  $("#progress").hidden = total == null;
+  if (total) $("#progress-fill").style.width = `${Math.round((done / total) * 100)}%`;
+}
+
+function setBusy(busy) {
+  $("#lookup-btn").disabled = busy;
+  $("#file-input").disabled = busy;
+}
+
+function renderSingle(r) {
+  $("#batch").hidden = true;
+  $("#single").hidden = false;
+  const best = r.best;
+  const answer = $("#answer");
+  answer.replaceChildren();
+
+  if (best) {
+    const rf = best.receita || {};
+    answer.append(
+      h("p", { class: "kicker" }, r.dom.host),
+      h("div", { class: "answer-head" },
+        h("h2", { class: "cnpj" }, formatCnpj(best.cnpj)),
+        badge(best.confidence)),
+      h("p", { class: "company" }, rf.razao || r.siteTitle || "Razão social não confirmada"),
+      h("dl", { class: "facts" },
+        fact("Nome fantasia", rf.fantasia),
+        fact("Situação", rf.situacao),
+        fact("Cidade", rf.cidade),
+        fact("Atividade", rf.atividade),
+        fact("Aberta em", rf.abertura && new Date(rf.abertura + "T00:00").toLocaleDateString("pt-BR"))),
+      h("p", { class: "muted" }, "Por quê: " + best.reasons.join("; ") + "."),
+    );
+  } else {
+    answer.append(
+      h("p", { class: "kicker" }, r.dom.host),
+      h("h2", {}, "Nenhum CNPJ encontrado"),
+      h("p", { class: "muted" }, r.dom.root.endsWith(".br")
+        ? "O registro do domínio não mostra CNPJ e o site não publica um nas páginas comuns."
+        : "Domínios fora do .br não têm registro público com CNPJ, e o site não publica um nas páginas comuns."),
+    );
+  }
+
+  const cand = $("#candidates");
+  cand.replaceChildren(...(r.candidates.length ? r.candidates.map(renderCandidate) : [h("p", { class: "empty" }, "Nenhum candidato.")]));
+
+  $("#sources").replaceChildren(...r.sources.map((s) =>
+    h("li", { class: s.skip ? "skip" : s.ok ? "ok" : "no" },
+      h("span", { class: "dot" }), h("strong", {}, s.name), h("span", { class: "muted" }, s.note))));
+
+  const mx = $("#mx");
+  if (!r.mx) mx.replaceChildren(h("p", { class: "empty" }, "Não foi possível consultar o DNS."));
+  else if (!r.mx.length) mx.replaceChildren(h("p", { class: "empty" }, "Este domínio não recebe e-mail (sem MX)."));
+  else mx.replaceChildren(...r.mx.map((m) =>
+    h("div", { class: "row" }, h("code", {}, m.host), h("span", { class: "muted" }, `${m.provider} · prioridade ${m.priority}`))));
+}
+
+function fact(label, value) {
+  if (!value) return null;
+  return h("div", {}, h("dt", {}, label), h("dd", {}, value));
+}
+
+function renderCandidate(c) {
+  const rf = c.receita || {};
+  return h("div", { class: "candidate" },
+    h("div", { class: "row" }, h("strong", {}, formatCnpj(c.cnpj)), badge(c.confidence)),
+    h("p", {}, rf.razao || (rf.found === false ? "Não encontrado na Receita" : rf.error ? `Receita: ${rf.error}` : "—")),
+    ...c.evidence.map((e) => h("p", { class: "evidence" },
+      h("span", { class: "tag" }, e.kind === "rdap" ? "Registro.br" : "Site"),
+      e.url ? h("a", { href: e.url, target: "_blank", rel: "noopener noreferrer" }, "“" + e.text + "”") : e.text)),
+  );
+}
+
+/* ---------------- lote ---------------- */
+
+let batchRows = [];
+
+async function readSpreadsheet(file) {
+  const name = file.name.toLowerCase();
+  let rows;
+  if (name.endsWith(".xlsx") || name.endsWith(".xls")) {
+    await loadSheetJs();
+    const wb = XLSX.read(await file.arrayBuffer(), { type: "array" });
+    rows = wb.SheetNames.flatMap((n) => XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: false }));
+  } else {
+    const text = await file.text();
+    const first = text.split(/\r?\n/, 1)[0];
+    const sep = [";", "\t", ","].sort((a, b) => first.split(b).length - first.split(a).length)[0];
+    rows = text.split(/\r?\n/).map((line) => line.split(sep).map((c) => c.replace(/^"|"$/g, "")));
+  }
+
+  // Procura domínios em qualquer célula (site, URL ou e-mail).
+  const seen = new Map();
+  const freeMail = /^(gmail|hotmail|outlook|yahoo|bol|uol|live|icloud|terra|ig)\./;
+  for (const row of rows) {
+    for (const cell of row || []) {
+      const s = String(cell ?? "").trim();
+      if (!s || s.length > 300 || !s.includes(".")) continue;
+      const d = normalizeDomain(s);
+      if (d && !freeMail.test(d.root) && !seen.has(d.root)) seen.set(d.root, d.host);
     }
-    
-    batchResults.appendChild(fragment);
+  }
+  return [...seen.values()];
+}
+
+function loadSheetJs() {
+  if (window.XLSX) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
+    s.onload = resolve;
+    s.onerror = () => reject(new Error("não consegui carregar o leitor de Excel"));
+    document.head.append(s);
   });
 }
+
+async function runBatch(domains) {
+  $("#single").hidden = true;
+  $("#batch").hidden = false;
+  $("#export-btn").disabled = true;
+  $("#batch-title").textContent = `Resultados (${domains.length} domínios)`;
+  const body = $("#batch-body");
+  body.replaceChildren();
+  batchRows = domains.map((d) => {
+    const tr = h("tr", {}, h("td", {}, d), h("td", { colspan: 5, class: "muted" }, "na fila…"));
+    body.append(tr);
+    return { domain: d, tr };
+  });
+
+  let done = 0;
+  setProgress(0, domains.length);
+  const queue = [...batchRows];
+  const worker = async () => {
+    while (queue.length) {
+      const row = queue.shift();
+      row.tr.lastChild.textContent = "analisando…";
+      try {
+        row.result = await analyze(row.domain, { mode: "fast" });
+      } catch (e) {
+        row.error = e.message;
+      }
+      fillBatchRow(row);
+      done++;
+      setProgress(done, domains.length);
+      setStatus(`Analisando planilha: ${done} de ${domains.length}`, { loading: done < domains.length });
+    }
+  };
+  await Promise.all(Array.from({ length: BATCH_CONCURRENCY }, worker));
+
+  const found = batchRows.filter((r) => r.result?.best).length;
+  setStatus(`Pronto: CNPJ encontrado para ${found} de ${domains.length} domínios.`);
+  setProgress(null);
+  $("#export-btn").disabled = false;
+}
+
+function fillBatchRow(row) {
+  const b = row.result?.best;
+  const rf = b?.receita || {};
+  const mx = row.result?.mx;
+  row.tr.replaceChildren(
+    h("td", {}, row.domain),
+    h("td", {}, b ? h("code", {}, formatCnpj(b.cnpj)) : h("span", { class: "muted" }, row.error || "não encontrado")),
+    h("td", {}, rf.razao || ""),
+    h("td", {}, rf.situacao || ""),
+    h("td", {}, b ? badge(b.confidence) : ""),
+    h("td", {}, mx ? (mx.length ? mx[0].provider : "sem MX") : ""),
+  );
+}
+
+function exportCsv() {
+  const header = ["dominio", "cnpj", "razao_social", "nome_fantasia", "situacao", "cidade", "confianca", "motivo", "provedor_email"];
+  const lines = batchRows.map((r) => {
+    const b = r.result?.best;
+    const rf = b?.receita || {};
+    return [r.domain, b ? formatCnpj(b.cnpj) : "", rf.razao, rf.fantasia, rf.situacao, rf.cidade,
+      b?.confidence, b?.reasons.join("; ") || r.error, r.result?.mx?.[0]?.provider];
+  });
+  // ";" e BOM para o Excel em português abrir certo.
+  const csv = "﻿" + [header, ...lines]
+    .map((cols) => cols.map((v) => `"${String(v ?? "").replace(/"/g, '""')}"`).join(";")).join("\r\n");
+  const a = h("a", { href: URL.createObjectURL(new Blob([csv], { type: "text/csv" })), download: "radar-cnpj.csv" });
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+/* ---------------- eventos ---------------- */
+
+$("#lookup-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const value = $("#domain-input").value;
+  if (!normalizeDomain(value)) {
+    setStatus("Domínio inválido. Use algo como empresa.com.br.", { error: true });
+    return;
+  }
+  setBusy(true);
+  try {
+    const result = await analyze(value, { onStep: (t) => setStatus(t, { loading: true }) });
+    renderSingle(result);
+    setStatus(null);
+  } catch (err) {
+    console.error(err);
+    setStatus("Falhou: " + err.message, { error: true });
+  } finally {
+    setBusy(false);
+  }
+});
+
+$("#file-input").addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  e.target.value = "";
+  if (!file) return;
+  setBusy(true);
+  try {
+    setStatus("Lendo planilha…", { loading: true });
+    const domains = await readSpreadsheet(file);
+    if (!domains.length) {
+      setStatus("Não achei nenhum domínio na planilha.", { error: true });
+      return;
+    }
+    await runBatch(domains);
+  } catch (err) {
+    console.error(err);
+    setStatus("Erro na planilha: " + err.message, { error: true });
+  } finally {
+    setBusy(false);
+  }
+});
+
+$("#export-btn").addEventListener("click", exportCsv);
